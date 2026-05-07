@@ -156,10 +156,12 @@ fn audit_flags_wrong_dotdot_on_non_root_dir() {
 
     // Find ".." dirent slot in the new subdir.
     let dotdot_slot;
+    let bs;
     {
         let dev = FileDevice::open_rw(&path).expect("open rw 2");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount 2");
         dotdot_slot = find_dirent_slot(&fs, subdir_ino, b"..");
+        bs = fs.sb.block_size();
         // Sanity: a fresh subdir's ".." points at root.
         assert_eq!(
             dotdot_slot.2,
@@ -173,7 +175,6 @@ fn audit_flags_wrong_dotdot_on_non_root_dir() {
     // the claim against the walker's actual_parent map, so any value
     // other than 2 triggers.
     let fake_parent: u32 = 99;
-    let bs = 4096u32;
     poke_inode_field_raw(&path, bs, dotdot_slot.0, dotdot_slot.1, fake_parent);
 
     // Recompute the dir-block CRC tail so the audit's mount path
@@ -185,9 +186,10 @@ fn audit_flags_wrong_dotdot_on_non_root_dir() {
         fix_dir_csum_after_poke(&path, &fs, subdir_ino, dotdot_slot.0);
     }
 
-    // Audit the corrupted image.
+    // Audit the corrupted image. Read-only is sufficient — audit is a
+    // diagnostic pass and any accidental write would surface as failure.
     {
-        let dev = FileDevice::open_rw(&path).expect("open rw audit");
+        let dev = FileDevice::open(&path).expect("open ro audit");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount audit");
         let report = fs.audit(u32::MAX, u32::MAX).expect("audit");
         let detected = report.anomalies.iter().any(|a| {
