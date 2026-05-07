@@ -2403,6 +2403,10 @@ pub unsafe extern "C" fn fs_ext4_fsck_run(
                 set_err_msg("fsck: opts.read_only must be 0 or 1", EINVAL);
                 return -1;
             }
+            if opts_ref.repair > 1 {
+                set_err_msg("fsck: opts.repair must be 0 or 1", EINVAL);
+                return -1;
+            }
             if opts_ref.read_only == 1 && opts_ref.repair == 1 {
                 set_err_msg("fsck: opts.repair = 1 requires opts.read_only = 0", EINVAL);
                 return -1;
@@ -2496,20 +2500,23 @@ pub unsafe extern "C" fn fs_ext4_fsck_run(
                     report_out.anomalies_found = audit_report.anomalies_count;
                     report_out.initial_anomalies_count = audit_report.initial_anomalies_count;
                     report_out.repaired_count = audit_report.repaired_count;
-                    // `dirty_cleared` is 1 only when a repair actually
-                    // committed something AND the post-run superblock
-                    // is clean. The repair path itself updates SB
-                    // state when it runs to completion, so this is a
-                    // proxy for "the on-disk dirty bit was cleared by
-                    // this run."
-                    report_out.dirty_cleared = if repair_requested
-                        && audit_report.repaired_count > 0
-                        && fs_ref.sb.is_clean()
-                    {
-                        1
+                    // `dirty_cleared` reports whether the on-disk
+                    // dirty bit transitioned from set to clear over
+                    // this run. Two requirements: (a) the FS was
+                    // dirty pre-run (otherwise there's nothing to
+                    // clear), and (b) the on-disk SB is clean after
+                    // any repair commits. We can't trust
+                    // `fs_ref.sb.is_clean()` here — that's the parsed
+                    // mount-time snapshot, never mutated by repair —
+                    // so re-read the SB from disk to get the truth.
+                    let post_sb_clean = if repair_requested && report_out.was_dirty == 1 {
+                        crate::superblock::Superblock::read(fs_ref.dev.as_ref())
+                            .map(|sb| sb.is_clean())
+                            .unwrap_or(false)
                     } else {
-                        0
+                        false
                     };
+                    report_out.dirty_cleared = if post_sb_clean { 1 } else { 0 };
                     0
                 }
                 Err(e) => {

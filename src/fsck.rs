@@ -567,12 +567,10 @@ fn audit_free_counts(
     on_finding: &mut dyn FnMut(&Anomaly),
     report: &mut AuditReport,
 ) -> Result<()> {
-    let bs = fs.sb.block_size() as u64;
     let bpg = fs.sb.blocks_per_group as u64;
     let ipg = fs.sb.inodes_per_group as u64;
     let total_blocks = fs.sb.blocks_count;
     let first_data = fs.sb.first_data_block as u64;
-    let mut buf = vec![0u8; bs as usize];
 
     let mut sum_free_blocks: u64 = 0;
     let mut sum_free_inodes: u64 = 0;
@@ -580,17 +578,21 @@ fn audit_free_counts(
     for (gi, bg) in fs.groups.iter().enumerate() {
         // Block bitmap: count zero bits across the bytes covering the
         // bits that actually correspond to this group's blocks. The
-        // last group may be partial.
+        // last group may be partial. Go through `read_block` so the
+        // post-repair re-scan sees post-commit-pre-checkpoint pinned
+        // bytes — `dev.read_at` would skip the cache and surface the
+        // stale on-disk image, falsely re-emitting drift findings the
+        // repair pass just fixed.
         let group_first_block = first_data + gi as u64 * bpg;
         let group_block_count = std::cmp::min(bpg, total_blocks.saturating_sub(group_first_block));
-        fs.dev.read_at(bg.block_bitmap * bs, &mut buf)?;
-        let observed_blocks = count_zero_bits_le(&buf, group_block_count as u32);
+        let block_bitmap = fs.read_block(bg.block_bitmap)?;
+        let observed_blocks = count_zero_bits_le(&block_bitmap, group_block_count as u32);
 
         // Inode bitmap: every group has exactly inodes_per_group
         // inodes (the ext4 layout doesn't leave a partial last group
         // for inodes; the trailing bits are reserved-as-1).
-        fs.dev.read_at(bg.inode_bitmap * bs, &mut buf)?;
-        let observed_inodes = count_zero_bits_le(&buf, ipg as u32);
+        let inode_bitmap = fs.read_block(bg.inode_bitmap)?;
+        let observed_inodes = count_zero_bits_le(&inode_bitmap, ipg as u32);
 
         sum_free_blocks += observed_blocks as u64;
         sum_free_inodes += observed_inodes as u64;
@@ -740,6 +742,13 @@ where
     P: FnMut(FsckPhase, u64, u64),
     F: FnMut(&Anomaly),
 {
+    // Refuse repair on read-only mounts before any scanning. The full
+    // walk is expensive, and a refused repair shouldn't look like a
+    // partially-successful audit to the caller.
+    if repair && !fs.dev.is_writable() {
+        return Err(Error::ReadOnly);
+    }
+
     let mut report = AuditReport::default();
     on_progress(FsckPhase::Superblock, 0, 1);
     on_progress(FsckPhase::Superblock, 1, 1);
@@ -768,12 +777,6 @@ where
     if !repair {
         report.anomalies = collected;
         return Ok(report);
-    }
-
-    // Repair phase. Refuse on read-only mounts up front so we don't
-    // partially touch state and then bail mid-loop.
-    if !fs.dev.is_writable() {
-        return Err(Error::ReadOnly);
     }
 
     for finding in &collected {
@@ -920,13 +923,17 @@ fn repair_duplicate_dir_inode(
     // Drop every duplicate edge except the first. Each iteration reads
     // the parent's dir blocks fresh so a previous removal in the same
     // parent (rare — needs two duplicates with the same parent) is
-    // visible.
+    // visible. `repaired_count` advances once per finding, not once
+    // per alias removed — the caller's
+    // `initial_anomalies_count - repaired_count` reconciliation
+    // counts findings, so a 3-alias finding still represents one
+    // repaired anomaly.
+    let mut any_removed = false;
     for (parent_ino, name) in dirents.iter().skip(1) {
         let (parent_inode, _parent_raw) = fs.read_inode_verified(*parent_ino)?;
         if !parent_inode.is_dir() {
             // The parent itself isn't a directory anymore — bail on
-            // this duplicate and let a later pass clean up. Don't
-            // bump repaired_count; the on-disk state didn't change.
+            // this duplicate and let a later pass clean up.
             continue;
         }
         let mut buf = BlockBuffer::new(bs);
@@ -966,6 +973,9 @@ fn repair_duplicate_dir_inode(
             continue;
         }
         fs.commit_block_buffer(buf)?;
+        any_removed = true;
+    }
+    if any_removed {
         report.repaired_count += 1;
     }
 

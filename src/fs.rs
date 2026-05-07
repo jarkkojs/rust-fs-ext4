@@ -213,7 +213,13 @@ impl Filesystem {
         // so the device-layer cache's "pinned" entries (post-commit but
         // pre-checkpoint) are now consistent with disk. Tell the cache
         // it can stop pinning them — future evictions are safe.
-        self.dev.unpin_all();
+        // Skip when nothing replayed: a clean journal returns 0, and
+        // unpinning here would demote pinned-but-still-needed entries
+        // from a live handle's prior journaled writes, letting later
+        // cache misses serve stale data-area bytes.
+        if n > 0 {
+            self.dev.unpin_all();
+        }
         Ok(n)
     }
 
