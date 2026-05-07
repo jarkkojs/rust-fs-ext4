@@ -2411,6 +2411,10 @@ pub unsafe extern "C" fn fs_ext4_fsck_run(
                 set_err_msg("fsck: opts.read_only must be 0 or 1", EINVAL);
                 return -1;
             }
+            if opts_ref.replay_journal > 1 {
+                set_err_msg("fsck: opts.replay_journal must be 0 or 1", EINVAL);
+                return -1;
+            }
             if opts_ref.repair > 1 {
                 set_err_msg("fsck: opts.repair must be 0 or 1", EINVAL);
                 return -1;

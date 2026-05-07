@@ -25,12 +25,14 @@
 //!   stable shape of `Anomaly` plus a versioned ABI bump is a
 //!   separate task.
 
+use crate::bgd;
 use crate::dir::{self, DirBlockIter, DirEntryType};
 use crate::error::{Error, Result};
 use crate::extent;
 use crate::features;
 use crate::fs::{BlockBuffer, Filesystem};
 use crate::inode::Inode;
+use crate::superblock::Superblock;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -594,10 +596,21 @@ fn audit_free_counts(
     let total_blocks = fs.sb.blocks_count;
     let first_data = fs.sb.first_data_block as u64;
 
+    // Re-read BGDs and SB from disk for each scan rather than
+    // trusting `fs.groups` / `fs.sb` (mount-time snapshots, never
+    // mutated). The post-repair re-scan needs the patched values to
+    // avoid re-emitting drift findings the repair pass just fixed:
+    // bitmaps come from `fs.read_block` (sees pinned post-commit
+    // bytes), so the comparison's "stored" side has to match — read
+    // the descriptors and SB the same way for both halves of the
+    // compare to look at the same point in time.
+    let live_groups = bgd::read_all(fs.dev.as_ref(), &fs.sb, &fs.csum)?;
+    let live_sb = Superblock::read(fs.dev.as_ref())?;
+
     let mut sum_free_blocks: u64 = 0;
     let mut sum_free_inodes: u64 = 0;
 
-    for (gi, bg) in fs.groups.iter().enumerate() {
+    for (gi, bg) in live_groups.iter().enumerate() {
         // Block bitmap: count zero bits across the bytes covering the
         // bits that actually correspond to this group's blocks. The
         // last group may be partial. Go through `read_block` so the
@@ -636,13 +649,13 @@ fn audit_free_counts(
     // descriptor-derived sum — a torn SB write can leave the SB
     // disagreeing with descriptors that themselves agree with the
     // bitmaps. We want the truth.
-    if sum_free_blocks != fs.sb.free_blocks_count
-        || (sum_free_inodes as u32) != fs.sb.free_inodes_count
+    if sum_free_blocks != live_sb.free_blocks_count
+        || (sum_free_inodes as u32) != live_sb.free_inodes_count
     {
         let a = Anomaly::SuperblockFreeCountDrift {
-            stored_blocks: fs.sb.free_blocks_count,
+            stored_blocks: live_sb.free_blocks_count,
             observed_blocks: sum_free_blocks,
-            stored_inodes: fs.sb.free_inodes_count,
+            stored_inodes: live_sb.free_inodes_count,
             observed_inodes: sum_free_inodes as u32,
         };
         on_finding(&a);
@@ -899,8 +912,6 @@ where
         }
     }
 
-    report.anomalies = collected;
-
     // Post-repair re-scan. Walking the tree again is expensive, but
     // it's the only way to give the caller a TRUTHFUL "what's still
     // wrong" count. If our repair logic accidentally introduced new
@@ -909,27 +920,29 @@ where
     //   expected_remaining = initial_anomalies_count - repaired_count
     //   actual_remaining   = anomalies_count (from this re-scan)
     // The caller's `on_progress` is reused so the host UI keeps
-    // rendering progress for the second walk; `on_finding` is a
+    // rendering progress for the second walk. `on_finding` is a
     // no-op closure here because the pre-repair stream already gave
-    // the caller the per-finding detail and emitting again would
-    // double-count in the UI.
+    // the caller the per-finding detail and re-emitting would
+    // double-count in the UI — but we DO buffer remaining findings
+    // locally so `report.anomalies` reflects the post-repair truth
+    // (consistent with `report.anomalies_count`).
     let mut post_report = AuditReport::default();
+    let mut remaining: Vec<Anomaly> = Vec::new();
     audit_inner(
         fs,
         max_dirs_visited,
         max_entries_per_dir,
         &mut on_progress,
-        &mut |_a| {
-            // Intentionally don't re-emit; pre-repair stream already
-            // covered the per-finding detail. The count is what we
-            // care about here.
+        &mut |a| {
+            remaining.push(a.clone());
         },
         &mut post_report,
     )?;
 
-    // Replace the live count with the post-repair number. Keep
-    // `initial_anomalies_count` unchanged so the caller can see the
-    // before-vs-after delta.
+    // Replace the live count + anomalies list with the post-repair
+    // numbers. Keep `initial_anomalies_count` unchanged so the
+    // caller can see the before-vs-after delta.
+    report.anomalies = remaining;
     report.anomalies_count = post_report.anomalies_count;
 
     Ok(report)
@@ -1051,8 +1064,19 @@ fn count_subdirs(
         if e.name == b"." || e.name == b".." {
             continue;
         }
+        // Don't trust the dirent's `file_type` byte — that's exactly
+        // what `BogusEntry` exists to detect. Verify the child
+        // inode's mode bits before counting. Unreadable children and
+        // mode mismatches are silently skipped: repair_duplicate_dir
+        // _inode just needs the truthful current count, and a
+        // BogusEntry repair (if one runs in the same pass) will fix
+        // the dirent byte separately.
         if matches!(e.file_type, DirEntryType::Directory) {
-            n = n.saturating_add(1);
+            if let Ok((child_inode, _)) = fs.read_inode_verified(e.inode) {
+                if child_inode.is_dir() {
+                    n = n.saturating_add(1);
+                }
+            }
         }
     }
     Ok(n)
@@ -1260,8 +1284,13 @@ fn repair_bogus_entry(
             }
             // FILETYPE feature is on (we bailed otherwise above), so
             // byte 6 is the full name_len; byte 7 is file_type.
+            // Bound name comparison to the current record (8 +
+            // name_len <= rec_len) so a malformed dirent with
+            // name_len > rec_len can't read into the next record and
+            // patch the wrong file_type byte.
             let name_len = block[off + 6] as usize;
             if cur_inode == child_ino
+                && 8 + name_len <= rec_len
                 && off + 8 + name_len <= usable_end
                 && &block[off + 8..off + 8 + name_len] == name
             {
