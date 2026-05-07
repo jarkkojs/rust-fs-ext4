@@ -2324,10 +2324,18 @@ fn anomaly_to_capi(a: &crate::fsck::Anomaly) -> (&'static str, u32, String) {
             dir_ino,
             format!("claims={claims} actual_parent={actual_parent}"),
         ),
-        &Anomaly::BogusEntry {
+        Anomaly::BogusEntry {
             parent_ino,
             child_ino,
-        } => ("bogus_entry", child_ino, format!("parent_ino={parent_ino}")),
+            name,
+        } => (
+            "bogus_entry",
+            *child_ino,
+            format!(
+                "parent_ino={parent_ino} name={}",
+                String::from_utf8_lossy(name)
+            ),
+        ),
         &Anomaly::BlockGroupFreeCountDrift {
             group_index,
             stored_blocks,

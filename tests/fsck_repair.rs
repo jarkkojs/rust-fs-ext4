@@ -665,7 +665,7 @@ fn repair_fixes_bogus_entry() {
         let report = fsck::audit(&fs, u32::MAX, u32::MAX).expect("audit");
         let detected = report.anomalies.iter().any(|a| {
             matches!(a,
-                Anomaly::BogusEntry { parent_ino, child_ino }
+                Anomaly::BogusEntry { parent_ino, child_ino, .. }
                     if *parent_ino == fs_ext4::path::EXT4_ROOT_INODE && *child_ino == file_ino
             )
         });

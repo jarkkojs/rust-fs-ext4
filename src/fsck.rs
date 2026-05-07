@@ -82,7 +82,16 @@ pub enum Anomaly {
     /// inodes lets a repair pass either rewrite the dirent's
     /// `file_type` byte (when the child is a valid non-dir) or
     /// unlink the dirent.
-    BogusEntry { parent_ino: u32, child_ino: u32 },
+    /// Carries the dirent's `name` so the repair pass can target the
+    /// exact record by (parent, name) — necessary when the parent has
+    /// multiple hardlinks to the same inode and only one of them has
+    /// the wrong `file_type` byte. Stored as raw bytes since ext4
+    /// dirent names are not required to be UTF-8.
+    BogusEntry {
+        parent_ino: u32,
+        child_ino: u32,
+        name: Vec<u8>,
+    },
     /// One block group's free-block / free-inode counters drift from
     /// the bitmap reality. Either the bitmap claims fewer free bits
     /// than the descriptor says (over-count) or more (under-count).
@@ -304,8 +313,18 @@ fn audit_inner(
     // U+FFFD where the disk has a non-UTF-8 byte.
     let mut dirent_index: HashMap<u32, Vec<(u32, Vec<u8>)>> = HashMap::new();
 
-    let mut work: Vec<(u32, u32)> = Vec::new(); // (ino, parent_ino)
-    work.push((crate::path::EXT4_ROOT_INODE, crate::path::EXT4_ROOT_INODE));
+    // (ino, parent_ino, dirent_name) — `dirent_name` is the name in
+    // `parent_ino` whose dirent points at `ino`. Carried so a
+    // `BogusEntry` finding can disambiguate when the parent has
+    // multiple hardlinks to the same inode. Empty for the root
+    // self-seed (root never triggers BogusEntry — its inode is
+    // always a directory).
+    let mut work: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+    work.push((
+        crate::path::EXT4_ROOT_INODE,
+        crate::path::EXT4_ROOT_INODE,
+        Vec::new(),
+    ));
     let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     let has_filetype = fs.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
@@ -314,7 +333,7 @@ fn audit_inner(
     // Initial directory progress pulse: 0 of (just root).
     on_progress(FsckPhase::Directory, 0, work.len() as u64);
 
-    while let Some((dir_ino, parent_ino)) = work.pop() {
+    while let Some((dir_ino, parent_ino, dirent_name)) = work.pop() {
         if report.directories_scanned >= max_dirs_visited {
             incomplete_dirs.insert(dir_ino);
             break;
@@ -341,11 +360,14 @@ fn audit_inner(
         if !inode.is_dir() {
             // Parent claimed this child was a directory (file_type
             // byte in the dirent) but the inode's mode bits disagree.
-            // Carry both inodes so a repair pass can either rewrite
-            // the dirent's file_type byte or unlink the dirent.
+            // Carry both inodes plus the dirent name so a repair pass
+            // can either rewrite the dirent's file_type byte (precise
+            // (parent, name) match avoids hardlink ambiguity) or
+            // unlink the dirent.
             let a = Anomaly::BogusEntry {
                 parent_ino,
                 child_ino: dir_ino,
+                name: dirent_name.clone(),
             };
             on_finding(&a);
             report.anomalies_count += 1;
@@ -398,7 +420,7 @@ fn audit_inner(
                 .push((dir_ino, entry.name.clone()));
 
             if matches!(entry.file_type, DirEntryType::Directory) {
-                work.push((entry.inode, dir_ino));
+                work.push((entry.inode, dir_ino, entry.name.clone()));
             }
         }
         if truncated {
@@ -779,6 +801,22 @@ where
         return Ok(report);
     }
 
+    // For directories that ALSO appear in a DuplicateDirentForDirInode
+    // finding, the captured `actual_parent` is the parent the walker
+    // saw first — which may not be the one that survives dedup
+    // (`repair_duplicate_dir_inode` keeps `dirents[0]`). Override the
+    // WrongDotDot target with the post-dedup surviving parent so we
+    // don't rewrite `..` to point at the alias we just removed.
+    let surviving_parent_after_dedup: HashMap<u32, u32> = collected
+        .iter()
+        .filter_map(|a| match a {
+            Anomaly::DuplicateDirentForDirInode { ino, dirents } if !dirents.is_empty() => {
+                Some((*ino, dirents[0].0))
+            }
+            _ => None,
+        })
+        .collect();
+
     for finding in &collected {
         match finding {
             Anomaly::DuplicateDirentForDirInode { ino, dirents } => {
@@ -801,13 +839,18 @@ where
                 claims: _,
                 actual_parent,
             } => {
-                repair_wrong_dotdot(fs, *dir_ino, *actual_parent, &mut report)?;
+                let target_parent = surviving_parent_after_dedup
+                    .get(dir_ino)
+                    .copied()
+                    .unwrap_or(*actual_parent);
+                repair_wrong_dotdot(fs, *dir_ino, target_parent, &mut report)?;
             }
             Anomaly::BogusEntry {
                 parent_ino,
                 child_ino,
+                name,
             } => {
-                repair_bogus_entry(fs, *parent_ino, *child_ino, &mut report)?;
+                repair_bogus_entry(fs, *parent_ino, *child_ino, name, &mut report)?;
             }
             Anomaly::DanglingEntry {
                 parent_ino: _,
@@ -1146,10 +1189,19 @@ fn repair_bogus_entry(
     fs: &Filesystem,
     parent_ino: u32,
     child_ino: u32,
+    name: &[u8],
     report: &mut AuditReport,
 ) -> Result<()> {
     let has_ft = fs.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
     if !has_ft {
+        return Ok(());
+    }
+    if name.is_empty() {
+        // Defensive: detection always populates `name` for non-root
+        // BogusEntry findings. An empty name would mean "first match
+        // by inode," which is exactly the hardlink-ambiguity bug we
+        // moved away from. Bail rather than risk patching the wrong
+        // dirent.
         return Ok(());
     }
 
@@ -1177,7 +1229,11 @@ fn repair_bogus_entry(
         Err(_) => return Ok(()),
     };
 
-    // Walk parent dir blocks to find the dirent referencing child_ino.
+    // Walk parent dir blocks to find the dirent matching BOTH
+    // (inode == child_ino) AND (name == this finding's name). The
+    // (parent, name) pair is the unique key for a dirent — matching
+    // by inode alone misfires when the parent has multiple hardlinks
+    // to the same inode.
     let bs = fs.sb.block_size();
     let parent_blocks = parent_inode.size.div_ceil(bs as u64);
     let mut buf = BlockBuffer::new(bs);
@@ -1202,7 +1258,13 @@ fn repair_bogus_entry(
             if rec_len == 0 || off + rec_len > usable_end {
                 break;
             }
-            if cur_inode == child_ino {
+            // FILETYPE feature is on (we bailed otherwise above), so
+            // byte 6 is the full name_len; byte 7 is file_type.
+            let name_len = block[off + 6] as usize;
+            if cur_inode == child_ino
+                && off + 8 + name_len <= usable_end
+                && &block[off + 8..off + 8 + name_len] == name
+            {
                 hit_off = Some(off);
                 break;
             }

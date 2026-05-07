@@ -217,26 +217,45 @@ impl BlockDevice for CachedDevice {
             return Ok(());
         }
 
-        // Unaligned / multi-block write: we don't have a full block
-        // image to install in the cache, so drop the affected entries
-        // entirely. We have to drop `pinned` too — the partial direct
-        // write makes the on-disk block a merge of "journaled bytes
-        // for the unwritten portion + new bytes for the written
-        // portion", which doesn't match either the pre-write pinned
-        // image or the new write. Easiest correct answer: forget what
-        // we knew, let the next read pull the merged truth from disk.
+        // Unaligned / multi-block write. Two layers to handle:
         //
-        // Caller paid for this — the only sub-block write site in the
-        // crate today is `write_inode_raw` (writes a single inode at
-        // its offset within a 4 KiB inode-table block). Other direct
-        // writes (`set_block_run_used`, BGD blocks, indirect blocks)
-        // are full-block-aligned and take the fast path above.
+        // - PINNED blocks hold post-commit-pre-checkpoint journaled
+        //   bytes that don't yet exist on disk. We MUST NOT
+        //   invalidate them — the on-disk data area still has the
+        //   pre-commit version, so dropping the pinned image would
+        //   make the next read serve stale bytes for the unwritten
+        //   portion. Instead, overlay the new sub-block bytes onto
+        //   the pinned image so reads see (journaled bytes for the
+        //   unwritten portion + new bytes for the written portion).
+        //
+        // - LRU entries (clean, not pinned) can be dropped: we just
+        //   wrote to disk above, so the disk holds the merged truth
+        //   (old bytes for unwritten portion + new bytes for written
+        //   portion). The next read fetches that merged image.
+        //
+        // The only sub-block write site in the crate today is
+        // `write_inode_raw` (writes a single inode at its offset
+        // within a 4 KiB inode-table block); other direct writes
+        // (`set_block_run_used`, BGD blocks, indirect blocks) are
+        // full-block-aligned and take the fast path above.
         let first_block = offset / bs;
         let last_block = (offset + buf.len() as u64).saturating_sub(1) / bs;
+        let buf_end_byte = offset + buf.len() as u64;
         let mut state = self.state.lock().expect("cache mutex poisoned");
         for b in first_block..=last_block {
+            let block_start = b * bs;
+            let block_end = block_start + bs;
+            let write_start = offset.max(block_start);
+            let write_end = buf_end_byte.min(block_end);
+            let in_block_off = (write_start - block_start) as usize;
+            let in_block_end = (write_end - block_start) as usize;
+            let buf_start = (write_start - offset) as usize;
+            let buf_end = (write_end - offset) as usize;
+
+            if let Some(img) = state.pinned.get_mut(&b) {
+                img[in_block_off..in_block_end].copy_from_slice(&buf[buf_start..buf_end]);
+            }
             state.entries.remove(&b);
-            state.pinned.remove(&b);
         }
         Ok(())
     }
@@ -326,6 +345,41 @@ mod tests {
         let (hits, misses) = cached.stats();
         assert_eq!(hits, 2);
         assert_eq!(misses, 1);
+    }
+
+    #[test]
+    fn unaligned_write_merges_into_pinned_block() {
+        // Pinned blocks hold post-commit-pre-checkpoint journaled
+        // bytes that don't yet exist on disk. A sub-block write must
+        // NOT invalidate the pinned image — that would let later
+        // reads serve stale data-area bytes for the untouched portion.
+        // The cache must overlay the new sub-block bytes onto the
+        // pinned image, preserving everything else.
+        let inner = CountingDevice::new(4096 * 16, true);
+        let cached = CachedDevice::new(inner.clone(), 4096, 8);
+        // Pin block 5 with a synthetic post-commit image. Disk
+        // (CountingDevice) still holds zeros — the pre-commit version.
+        let mut journaled = vec![0u8; 4096];
+        journaled[0] = 0xAA;
+        journaled[3000] = 0xBB;
+        cached.populate_cache(5, journaled);
+        // Sub-block direct write touching bytes 100..200 of block 5.
+        cached.write_at(5 * 4096 + 100, &[0xCCu8; 100]).unwrap();
+        // Read back the full block via the cache.
+        let mut buf = vec![0u8; 4096];
+        for i in 0..4096 {
+            cached
+                .read_at(5 * 4096 + i as u64, &mut buf[i..i + 1])
+                .unwrap();
+        }
+        assert_eq!(buf[0], 0xAA, "pinned journaled byte 0 must survive");
+        assert_eq!(buf[100], 0xCC, "new sub-block bytes must be visible");
+        assert_eq!(buf[199], 0xCC);
+        assert_eq!(buf[200], 0x00, "untouched portion stays at journaled value");
+        assert_eq!(
+            buf[3000], 0xBB,
+            "pinned bytes outside the write window survive"
+        );
     }
 
     #[test]
