@@ -527,34 +527,72 @@ typedef void (*fs_ext4_fsck_progress_fn)(void *context,
 
 /*
  * Per-finding callback. `kind` is one of: "link_count_low",
- * "link_count_high", "dangling_entry", "wrong_dotdot", "bogus_entry".
- * `inode` is the most relevant inode (the affected inode for link-
- * count cases; the child for dangling_entry and bogus_entry; the
- * directory for wrong_dotdot). `detail` is a short, free-form ASCII
- * blob like "stored=1 observed=2" or "parent_ino=2" — for diagnostic
- * display only, not meant to be parsed. Both `kind` and `detail` are
- * valid only for the duration of the call.
+ * "link_count_high", "dangling_entry", "wrong_dotdot", "bogus_entry",
+ * "duplicate_dir_inode", "block_group_free_count_drift",
+ * "superblock_free_count_drift". `inode` is the most relevant inode
+ * (affected inode for link-count cases; child for dangling_entry and
+ * bogus_entry; directory for wrong_dotdot; duplicated dir inode for
+ * duplicate_dir_inode; group_index for block_group_free_count_drift;
+ * 0 for superblock_free_count_drift — i.e. for the drift kinds the
+ * field is overloaded and does not carry an inode number). `detail`
+ * is a short, free-form ASCII blob like "stored=1 observed=2" or
+ * "parent_ino=2" — for diagnostic display only, not meant to be
+ * parsed. Both `kind` and `detail` are valid only for the duration of
+ * the call.
  */
 typedef void (*fs_ext4_fsck_finding_fn)(void *context,
     const char *kind, uint32_t inode, const char *detail);
 
 typedef struct {
-    uint8_t  read_only;            /* MVP: caller MUST set to 1 */
+    uint8_t  read_only;            /* 1 = audit only (no writes); 0 = allow repair */
     uint8_t  replay_journal;       /* 1 = invoke replay_journal_if_dirty first */
     uint32_t max_dirs;             /* 0 = unbounded (use u32::MAX internally) */
     uint32_t max_entries_per_dir;  /* 0 = unbounded */
     fs_ext4_fsck_progress_fn on_progress; /* nullable */
     fs_ext4_fsck_finding_fn  on_finding;  /* nullable */
     void *context;
+    /*
+     * Repair-pass switch. When 1 (and `read_only` is 0) the audit
+     * pass commits journaled fixes for the corruption classes it
+     * knows how to handle today:
+     *   - duplicate dir-entry → same directory inode
+     *   - link-count drift (i_links_count != observed dirent count)
+     *   - wrong_dotdot (.. claim disagrees with walker's parent)
+     *   - bogus_entry (dirent file_type vs. inode mode mismatch)
+     *   - dangling_entry (link-count rescue when child is readable)
+     *   - block_group_free_count_drift / superblock_free_count_drift
+     * Other anomalies are still detected and reported but not
+     * modified. When 0 (or `read_only` == 1) the run is purely
+     * diagnostic. Must be 0 or 1; other values are rejected as
+     * EINVAL.
+     */
+    uint8_t  repair;
 } fs_ext4_fsck_options_t;
 
 typedef struct {
     uint64_t inodes_visited;
     uint64_t directories_scanned;
     uint64_t entries_scanned;
+    /* Authoritative current anomaly count. After a repair pass this
+     * is the post-repair RE-SCAN count, not pre-repair minus
+     * repaired_count. */
     uint64_t anomalies_found;
     uint8_t  was_dirty;            /* 1 if SB.s_state showed dirty pre-run */
-    uint8_t  dirty_cleared;        /* MVP: always 0 (read-only) */
+    uint8_t  dirty_cleared;        /* 1 if a repair commit cleared the dirty bit */
+    /*
+     * Number of anomalies the repair pass committed a fix for. 0 when
+     * `repair` was off, when no repairable anomalies were found, or
+     * when every found anomaly is in a class fsck doesn't repair yet.
+     */
+    uint64_t repaired_count;
+    /*
+     * Anomalies the audit found BEFORE any repair commits. Equal to
+     * `anomalies_found` for non-repair runs. After a repair pass:
+     * `initial_anomalies_count - repaired_count` is what we EXPECT
+     * to remain; `anomalies_found` is what ACTUALLY remains.
+     * Mismatches indicate repair-logic bugs.
+     */
+    uint64_t initial_anomalies_count;
 } fs_ext4_fsck_report_t;
 
 /*
