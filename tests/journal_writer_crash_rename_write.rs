@@ -97,7 +97,7 @@ fn crash_during_rename_yields_consistent_state() {
             let inner = FileDevice::open_rw(&path).expect("rw");
             let crash = Arc::new(CrashDevice::new(Arc::new(inner), budget));
             let fs = Filesystem::mount(crash).expect("mount");
-            let _ = fs.apply_rename("/test.txt", "/renamed.txt");
+            let _ = fs.apply_rename("/test.txt", "/renamed.txt", false);
         });
         assert!(result.is_ok(), "[budget={budget}] rename panicked");
         let dev = FileDevice::open_rw(&path).expect("rw remount");

@@ -3,6 +3,14 @@
 Generated: 2026-04-19. Triaged list of critical gaps, bugs, and
 performance wins for the pure-Rust ext4 driver at `v0.1.0`.
 
+> **Newer follow-ups:** `STATUS-2026-05-08.md` covers the streaming-pwrite
+> + extent-depth-promotion + rename-overwrite + long-symlink work and the
+> currently-deferred items (B3 uninit-extent overwrite, A2 NT security
+> mapping, B5 multi-group mkfs). Several items below (depth-≥2 extent
+> mutations, external-xattr-block writes, sparse-truncate-grow) are now
+> partially or fully implemented; check `ext4-full-write-support.md` for
+> the up-to-date write-feature matrix before picking from the list below.
+
 ## Top 10 Priorities (by shipping impact)
 
 1. **Journaled writes** — write path currently bypasses JBD2. Crash = metadata corruption.

@@ -21,3 +21,4 @@ test-disks/*.img
 .lwext4/
 .qemu/
 **/.vagrant/
+.claude/

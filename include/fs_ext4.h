@@ -390,12 +390,46 @@ uint32_t fs_ext4_create(fs_ext4_fs_t *fs, const char *path,
 int64_t fs_ext4_write_file(fs_ext4_fs_t *fs, const char *path,
                                const void *data, uint64_t len);
 
+/* Positional write — splice `len` bytes from `data` into `path` at byte
+ * `offset`. Allocates new physical blocks for any logical blocks not yet
+ * mapped (sparse holes / past EOF); existing mapped blocks are read-
+ * modify-written so untouched bytes stay intact. The file must already
+ * exist (use `fs_ext4_create` first).
+ *
+ * This is the streaming-write primitive — cost is O(len), not
+ * O(filesize). FUSE / WinFsp / FSKit cache-manager dispatches should
+ * call this directly instead of merging into a whole-file replace.
+ *
+ * Returns the new file size on success (>= offset+len), or -1 on
+ * failure. Hard cap on `len`: 1 GiB per call. */
+int64_t fs_ext4_pwrite(fs_ext4_fs_t *fs, const char *path,
+                           const void *data, uint64_t len, uint64_t offset);
+
 /* Rename / move `src` to `dst` within this filesystem. Supports files
  * and directories; cross-parent dir moves fix `..` + parent link counts.
- * Dest must not already exist. Returns 0 on success, -1 on failure.
- * Not yet journaled. */
+ * Dest must not already exist — for atomic overwrite use
+ * `fs_ext4_rename2` with the `FS_EXT4_RENAME_REPLACE` flag. Returns 0
+ * on success, -1 on failure. Not yet journaled. */
 int fs_ext4_rename(fs_ext4_fs_t *fs, const char *src,
                        const char *dst);
+
+/* Flag bits accepted by `fs_ext4_rename2`. `FS_EXT4_RENAME_REPLACE`
+ * enables atomic overwrite of an existing destination, matching POSIX
+ * `rename(2)` semantics — required so Windows Explorer "Save As" /
+ * drag-drop-onto-existing flows succeed instead of silently failing.
+ * Unknown flag bits are rejected with EINVAL so future flag additions
+ * stay forward-compatible. */
+#define FS_EXT4_RENAME_REPLACE 0x01
+
+/* Rename / move `src` to `dst` within this filesystem with explicit
+ * flags. With `FS_EXT4_RENAME_REPLACE` an existing destination is
+ * atomically replaced: file→file overwrites and frees the old data,
+ * empty-dir → empty-dir overwrites the dropped subdir, crossing the
+ * file/directory boundary returns EISDIR / ENOTDIR, and a non-empty
+ * destination directory returns ENOTEMPTY. Without the flag, identical
+ * to `fs_ext4_rename`. Returns 0 on success, -1 on failure. */
+int fs_ext4_rename2(fs_ext4_fs_t *fs, const char *src,
+                        const char *dst, int flags);
 
 /* Create a hard link at `dst` pointing to the same inode as `src`.
  * Forbidden on directories. Dest must not already exist. Bumps the

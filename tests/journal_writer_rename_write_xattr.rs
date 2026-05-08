@@ -64,7 +64,7 @@ fn rename_advances_journal_sequence() {
     {
         let dev = FileDevice::open_rw(&path).expect("rw");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
-        fs.apply_rename("/test.txt", "/renamed.txt")
+        fs.apply_rename("/test.txt", "/renamed.txt", false)
             .expect("rename");
     }
     let seq_after = jsb_seq(&path);

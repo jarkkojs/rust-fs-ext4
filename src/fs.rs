@@ -73,6 +73,31 @@ fn split_parent_and_base(path: &str) -> Result<(String, String)> {
     Ok((parent.to_string(), base.to_string()))
 }
 
+/// `DeepReader` adapter that pulls extent-tree internal/leaf node blocks
+/// straight from a `Filesystem`'s underlying device (which at mount time
+/// is wrapped in a `CachedDevice`, so reads benefit from the buffer cache
+/// holding post-commit pre-checkpoint journaled writes).
+///
+/// Used by `apply_pwrite` to satisfy `plan_insert_extent_deep`'s
+/// `&dyn DeepReader` argument when the inline extent root overflows and
+/// the tree needs to be promoted to depth ≥ 1.
+pub(crate) struct FsBlockReader<'a> {
+    pub(crate) fs: &'a Filesystem,
+}
+
+impl<'a> crate::extent_mut::DeepReader for FsBlockReader<'a> {
+    fn read_block(&self, block: u64, out: &mut [u8]) -> Result<()> {
+        let bytes = self.fs.read_block(block)?;
+        if bytes.len() != out.len() {
+            return Err(Error::Corrupt(
+                "FsBlockReader: block length mismatch (callers must pass a buffer sized to fs block_size)",
+            ));
+        }
+        out.copy_from_slice(&bytes);
+        Ok(())
+    }
+}
+
 /// Current wall time as a u32 — matches ext4's `i_dtime` field. Uses
 /// `SystemTime::now()`; we don't care about monotonicity here, just that
 /// `dtime > ctime` so `ext4 audit tool` recognises the slot as recently deleted.
@@ -1963,7 +1988,11 @@ impl Filesystem {
         if target.is_empty() {
             return Err(Error::InvalidArgument("symlink target is empty"));
         }
-        if target.len() > 255 {
+        // PATH_MAX cap (matches Linux). Slow path allocates exactly one fs
+        // block, so we additionally require target.len() <= block_size — the
+        // 4096 ceiling matches the typical ext4 block size and Linux PATH_MAX.
+        let max_target = 4096usize.min(self.sb.block_size() as usize);
+        if target.len() > max_target {
             return Err(Error::NameTooLong);
         }
         let (parent_path, base_name) = split_parent_and_base(linkpath)?;
@@ -2016,9 +2045,12 @@ impl Filesystem {
             plan.sb.free_inodes_delta,
         )?;
 
-        // Fast-symlink if target fits inline; otherwise allocate a block
-        // and stage its bytes into the buffer.
-        let raw = if target.len() <= 60 {
+        // Fast-symlink if target strictly fits inline (i_block is 60 bytes);
+        // otherwise allocate a block and stage its bytes into the buffer.
+        // Linux's `ext4_symlink` switches to the slow path when
+        // `target.len() >= sizeof(i_block)` (i.e. >= 60), and our readlink
+        // path mirrors that boundary, so we match here.
+        let raw = if target.len() < 60 {
             self.build_fast_symlink_inode(new_ino, target.as_bytes())?
         } else {
             let mut bitmap_reader = |block: u64| self.read_block(block);
@@ -2084,7 +2116,7 @@ impl Filesystem {
     /// store their target directly in the 60-byte `i_block` area — no
     /// extent tree).
     fn build_fast_symlink_inode(&self, ino: u32, target: &[u8]) -> Result<Vec<u8>> {
-        debug_assert!(target.len() <= 60);
+        debug_assert!(target.len() < 60);
         let inode_size = self.sb.inode_size as usize;
         let mut raw = vec![0u8; inode_size];
 
@@ -2140,7 +2172,7 @@ impl Filesystem {
     /// Caller must have already written the target bytes (zero-padded) to
     /// `data_phys * block_size`.
     fn build_slow_symlink_inode(&self, ino: u32, target: &[u8], data_phys: u64) -> Result<Vec<u8>> {
-        debug_assert!(target.len() > 60 && target.len() <= 255);
+        debug_assert!(target.len() >= 60 && target.len() <= 4096);
         let inode_size = self.sb.inode_size as usize;
         let mut raw = vec![0u8; inode_size];
 
@@ -2528,6 +2560,377 @@ impl Filesystem {
         let new_sectors = (needed_data_blocks as u64 + n_indirect as u64) * sectors_per_block;
         self.finalize_inode_after_write(ino, &mut raw, &inode, new_size, new_sectors)?;
         self.dev.flush()?;
+        Ok(new_size)
+    }
+
+    /// Positional write: splice `data` into the file at byte `offset`,
+    /// allocating new physical blocks for any logical blocks that aren't
+    /// yet mapped (sparse holes, or blocks past EOF). Existing mapped
+    /// blocks are read-modify-written for partial overlap; full-block
+    /// writes go in fresh.
+    ///
+    /// This is the primitive needed by streaming write paths
+    /// (FUSE/WinFsp/FSKit cache-manager dispatches) — `apply_replace_file_content`
+    /// is "save-as", `apply_pwrite` is `pwrite(2)`.
+    ///
+    /// Returns the new file size on success.
+    ///
+    /// Allocation behaviour:
+    /// - Each unmapped logical run is satisfied by one or more physical
+    ///   runs. If `plan_block_allocation` can't find a single contiguous
+    ///   group-local run sized for the whole logical run, the request is
+    ///   halved and retried — each successful sub-run becomes its own
+    ///   extent. True ENOSPC (single-block allocation also fails)
+    ///   surfaces as `Error::NoSpaceLeftOnDevice`.
+    /// - Extent inserts try the inline-root path first; on
+    ///   `LEAF_FULL_NEEDS_PROMOTION` they fall back to
+    ///   `plan_insert_extent_deep`, which promotes the tree to depth ≥ 1
+    ///   and allocates the additional internal/leaf node blocks via the
+    ///   same buffer-aware allocator. Tail checksums on tree blocks are
+    ///   patched when `metadata_csum` is on.
+    ///
+    /// v1 limitations:
+    /// - Extent-tree inodes only. Legacy ext2/3 (direct/indirect blocks)
+    ///   returns `Error::InvalidArgument`. The streaming-copy use case
+    ///   for this path is on freshly-mkfs'd ext4 volumes that always
+    ///   have `EXTENTS_FL`.
+    /// - Pre-existing uninitialised extents (from `fallocate`) in the
+    ///   write range: not handled — the unmapped-run walk treats them
+    ///   the same as holes and tries to insert a fresh extent that
+    ///   would overlap, hitting `CorruptExtentTree("extent overlaps
+    ///   existing")`. Skipping fallocate-then-write, the streaming
+    ///   copy path doesn't trigger this.
+    pub fn apply_pwrite(&self, path: &str, offset: u64, data: &[u8]) -> Result<u64> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+        if !inode.is_file() {
+            return Err(Error::InvalidArgument(
+                "pwrite target is not a regular file",
+            ));
+        }
+        if !inode.has_extents() {
+            return Err(Error::InvalidArgument(
+                "pwrite: legacy (non-extents) inodes not supported in v1",
+            ));
+        }
+
+        if data.is_empty() {
+            // No-op (no size change either — a zero-length pwrite at any
+            // offset is a no-op per POSIX `pwrite(2)`).
+            return Ok(inode.size);
+        }
+
+        let bs = self.sb.block_size() as u64;
+        let bs_usize = bs as usize;
+        let sectors_per_block = bs / 512;
+        let len = data.len() as u64;
+        let end = offset
+            .checked_add(len)
+            .ok_or(Error::InvalidArgument("pwrite: offset+len overflow"))?;
+        let first_lb = offset / bs;
+        let last_lb_excl = end.div_ceil(bs);
+
+        // Working copy of the 60-byte inline extent root. Updated in place
+        // as we insert extents for each unmapped run; patched into `raw`
+        // once at the end.
+        let mut root_bytes: Vec<u8> = inode.block.to_vec();
+
+        let mut buf = BlockBuffer::new(self.sb.block_size());
+        let group_idx_of_inode = ((ino - 1) / self.sb.inodes_per_group) as u32;
+
+        // Track which logical blocks were freshly allocated by this call.
+        // Phase-2 writes for these MUST NOT read from disk (the prior
+        // contents of those physical blocks are stale junk from whoever
+        // freed them last); they get a zero-init buffer instead.
+        let mut newly_alloc: std::collections::BTreeSet<u64> =
+            std::collections::BTreeSet::new();
+        let mut alloc_total_blocks: u64 = 0;
+
+        // Phase 1: walk affected logical blocks; allocate each contiguous
+        // unmapped run as one physical extent and stage the bitmap/BGD
+        // updates. Repeated `map_logical` calls re-parse `root_bytes` each
+        // time, so the in-progress inserts are visible to subsequent
+        // lookups in the same loop.
+        let mut lb = first_lb;
+        while lb < last_lb_excl {
+            let mapped = crate::extent::map_logical(
+                &root_bytes,
+                self.dev.as_ref(),
+                self.sb.block_size(),
+                lb,
+            )?;
+            if mapped.is_some() {
+                lb += 1;
+                continue;
+            }
+            // Find the end of this unmapped run.
+            let mut run_end = lb + 1;
+            while run_end < last_lb_excl {
+                let p = crate::extent::map_logical(
+                    &root_bytes,
+                    self.dev.as_ref(),
+                    self.sb.block_size(),
+                    run_end,
+                )?;
+                if p.is_some() {
+                    break;
+                }
+                run_end += 1;
+            }
+            let run_len_u64 = run_end - lb;
+            if run_len_u64 > u32::MAX as u64 {
+                return Err(Error::InvalidArgument(
+                    "pwrite: unmapped run exceeds u32 block count",
+                ));
+            }
+
+            // Allocate physical blocks for this logical run, splitting
+            // across smaller contiguous physical runs when no single
+            // group has a free run that size. Each sub-allocation is
+            // staged into the buffer (bitmap + BGD) and inserted as its
+            // own extent. plan_insert_extent auto-merges adjacent extents
+            // so the *common* sequential-write case still produces one
+            // extent overall.
+            let mut remaining_in_run = run_len_u64 as u32;
+            let mut sub_lb = lb;
+            while remaining_in_run > 0 {
+                let mut want = remaining_in_run;
+                let plan = loop {
+                    let plan_result = {
+                        let mut bitmap_reader = |b: u64| -> Result<Vec<u8>> {
+                            if let Some(bytes) = buf.dirty.get(&b) {
+                                return Ok(bytes.clone());
+                            }
+                            self.read_block(b)
+                        };
+                        crate::alloc::plan_block_allocation(
+                            &self.sb,
+                            &self.groups,
+                            want,
+                            group_idx_of_inode,
+                            &mut bitmap_reader,
+                        )
+                    };
+                    match plan_result {
+                        Ok(p) => break p,
+                        Err(Error::Corrupt(msg))
+                            if msg.contains("contiguous free run") =>
+                        {
+                            if want == 1 {
+                                // Even a single block isn't available
+                                // anywhere — true ENOSPC.
+                                return Err(Error::NoSpaceLeftOnDevice);
+                            }
+                            // Fragmented: halve the request and retry.
+                            // Each successful sub-run becomes its own
+                            // extent; the outer while loop keeps drawing
+                            // until the whole logical run is covered.
+                            want /= 2;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                };
+
+                let got = want;
+                let got_u64 = got as u64;
+
+                self.buffer_mark_block_run_used(&mut buf, plan.first_block, got_u64)?;
+                self.buffer_patch_bgd_counters(
+                    &mut buf,
+                    plan.bgd.group_idx as usize,
+                    plan.bgd.free_blocks_delta,
+                    plan.bgd.free_inodes_delta,
+                    plan.bgd.used_dirs_delta,
+                )?;
+                alloc_total_blocks += got_u64;
+
+                let new_extent = crate::extent::Extent {
+                    logical_block: sub_lb as u32,
+                    length: got as u16,
+                    physical_block: plan.first_block,
+                    uninitialized: false,
+                };
+
+                // Try the inline-root insert first; on overflow fall back
+                // to the depth-promoting deep insert. Both paths produce a
+                // new 60-byte root that we splice into `raw` at the end.
+                match crate::extent_mut::plan_insert_extent(&root_bytes, new_extent) {
+                    Ok(muts) => {
+                        for m in &muts {
+                            if let crate::extent_mut::ExtentMutation::WriteRoot { bytes } = m {
+                                root_bytes = bytes.clone();
+                            }
+                        }
+                    }
+                    Err(Error::CorruptExtentTree(msg))
+                        if msg.contains("LEAF_FULL_NEEDS_PROMOTION")
+                            || msg.contains("multi-level tree mutation") =>
+                    {
+                        // Two distinct failures both route to the deep path:
+                        // 1. Inline leaf root has 4 entries already
+                        //    (LEAF_FULL_NEEDS_PROMOTION) → promote to depth 1.
+                        // 2. Root has *already* been promoted on a prior
+                        //    insert in this same call → root is an index
+                        //    node, so the inline-leaf-only `plan_insert_extent`
+                        //    bails with "multi-level tree mutation". The
+                        //    deep planner descends correctly.
+                        // Allocate tree-meta blocks one at a time via the
+                        // same buffer-aware allocator. Each call stages a
+                        // bitmap + BGD update so subsequent allocations
+                        // see the just-claimed bits.
+                        let reader = FsBlockReader { fs: self };
+                        let mut meta_blocks_alloc: u64 = 0;
+                        let inode_generation = inode.generation;
+                        let deep_plan = {
+                            let mut alloc_closure = || -> Result<u64> {
+                                let p = {
+                                    let mut bitmap_reader =
+                                        |b: u64| -> Result<Vec<u8>> {
+                                            if let Some(bytes) =
+                                                buf.dirty.get(&b)
+                                            {
+                                                return Ok(bytes.clone());
+                                            }
+                                            self.read_block(b)
+                                        };
+                                    crate::alloc::plan_block_allocation(
+                                        &self.sb,
+                                        &self.groups,
+                                        1,
+                                        group_idx_of_inode,
+                                        &mut bitmap_reader,
+                                    )?
+                                };
+                                self.buffer_mark_block_run_used(
+                                    &mut buf,
+                                    p.first_block,
+                                    1,
+                                )?;
+                                self.buffer_patch_bgd_counters(
+                                    &mut buf,
+                                    p.bgd.group_idx as usize,
+                                    p.bgd.free_blocks_delta,
+                                    0,
+                                    0,
+                                )?;
+                                meta_blocks_alloc += 1;
+                                Ok(p.first_block)
+                            };
+                            crate::extent_mut::plan_insert_extent_deep(
+                                &root_bytes,
+                                new_extent,
+                                self.sb.block_size(),
+                                &reader,
+                                &mut alloc_closure,
+                            )?
+                        };
+                        root_bytes = deep_plan.new_root;
+                        let bs_u64 = self.sb.block_size() as u64;
+                        for (block, bytes) in deep_plan.block_writes {
+                            let mut bytes = bytes;
+                            if self.csum.enabled {
+                                self.csum.patch_extent_tail(
+                                    ino,
+                                    inode_generation,
+                                    &mut bytes,
+                                );
+                            }
+                            // Eager-write tree-meta blocks to disk so a
+                            // *subsequent* plan_insert_extent_deep within
+                            // this same apply_pwrite (when more sub-runs
+                            // follow and need to descend the just-promoted
+                            // tree) can fetch them via FsBlockReader. Also
+                            // stage in buf so the final commit_block_buffer
+                            // covers them inside the same transaction tail.
+                            // On a pre-commit crash these become orphaned
+                            // bytes that fsck reclaims (the block bitmap
+                            // mark is in `buf` and only lands on commit).
+                            self.dev.write_at(block * bs_u64, &bytes)?;
+                            buf.put(block, bytes);
+                        }
+                        alloc_total_blocks += meta_blocks_alloc;
+                    }
+                    Err(e) => return Err(e),
+                }
+
+                // Mark these logical blocks as freshly-allocated so Phase 2
+                // writes use put() (zero-init) instead of get_mut()
+                // (read-from-disk-and-modify).
+                for x in sub_lb..(sub_lb + got_u64) {
+                    newly_alloc.insert(x);
+                }
+
+                sub_lb += got_u64;
+                remaining_in_run -= got;
+            }
+
+            lb = run_end;
+        }
+
+        // Phase 2: splice the chunk into each affected block.
+        let mut data_off: usize = 0;
+        for cur_lb in first_lb..last_lb_excl {
+            let block_byte_start = cur_lb * bs;
+            let block_byte_end = block_byte_start + bs;
+            let chunk_start = offset.max(block_byte_start);
+            let chunk_end = end.min(block_byte_end);
+            let in_block_off = (chunk_start - block_byte_start) as usize;
+            let chunk_len = (chunk_end - chunk_start) as usize;
+
+            let phys = crate::extent::map_logical(
+                &root_bytes,
+                self.dev.as_ref(),
+                self.sb.block_size(),
+                cur_lb,
+            )?
+            .ok_or(Error::Corrupt(
+                "pwrite Phase 2: logical block unmapped after Phase 1 (allocator/extent insert mismatch)",
+            ))?;
+
+            if newly_alloc.contains(&cur_lb) {
+                // Fresh block: zero-init then splice. Avoids reading stale
+                // bytes from a previously-freed extent.
+                let mut block = vec![0u8; bs_usize];
+                block[in_block_off..in_block_off + chunk_len]
+                    .copy_from_slice(&data[data_off..data_off + chunk_len]);
+                buf.put(phys, block);
+            } else {
+                // Existing block: read-modify-write to preserve untouched
+                // bytes (head before `chunk_start`, tail after `chunk_end`).
+                let block = buf.get_mut(self, phys)?;
+                if block.len() != bs_usize {
+                    return Err(Error::Corrupt("pwrite Phase 2: existing block has wrong size"));
+                }
+                block[in_block_off..in_block_off + chunk_len]
+                    .copy_from_slice(&data[data_off..data_off + chunk_len]);
+            }
+
+            data_off += chunk_len;
+        }
+        debug_assert_eq!(data_off, data.len());
+
+        // Phase 3: patch the extent root onto `raw`, update size + sectors,
+        // recompute the inode checksum, stage the inode write.
+        Self::patch_inode_block_area(&mut raw, &root_bytes)?;
+        let new_size = inode.size.max(end);
+        let new_sectors = inode
+            .blocks
+            .checked_add(alloc_total_blocks * sectors_per_block)
+            .ok_or(Error::Corrupt("pwrite: i_blocks overflow"))?;
+        self.finalize_inode_raw_after_write(ino, &mut raw, &inode, new_size, new_sectors)?;
+        self.buffer_write_inode(&mut buf, ino, &raw)?;
+
+        // Phase 4: SB delta for the newly-allocated blocks.
+        if alloc_total_blocks > 0 {
+            self.buffer_patch_sb_counters(&mut buf, -(alloc_total_blocks as i64), 0)?;
+        }
+
+        // Phase 5: commit everything atomically (journaled if available).
+        self.commit_block_buffer(buf)?;
         Ok(new_size)
     }
 
@@ -3258,15 +3661,26 @@ impl Filesystem {
 
     /// Rename `src` → `dst` within the same filesystem.
     ///
-    /// Semantics (v1):
+    /// Semantics:
     /// - Both endpoints are within this mount.
     /// - Works for files and directories.
-    /// - Dest must NOT exist — overwrite-on-rename is follow-up work.
     /// - Cross-parent moves update the moved dir's `..` entry + bump /
     ///   decrement both parents' `i_links_count`.
     /// - Refuses to move a directory into its own subtree (cycle check).
     /// - Same source and dest: no-op success.
-    pub fn apply_rename(&self, src: &str, dst: &str) -> Result<()> {
+    /// - When dst already exists:
+    ///     - `replace_if_exists = false` → returns `Error::AlreadyExists`.
+    ///     - `replace_if_exists = true` → atomically overwrites dst.
+    ///       Type-compatibility rules (POSIX rename(2)):
+    ///         * file→dir   → `Error::IsADirectory`
+    ///         * dir→file   → `Error::NotADirectory`
+    ///         * non-empty-dir overwrite → `Error::DirectoryNotEmpty`
+    ///         * src and dst resolve to the same inode (hardlink) →
+    ///           no-op success.
+    ///       Otherwise the previous dst inode's link count is decremented
+    ///       in the same buffer; if that drops it to zero the inode's
+    ///       extents and slot are freed in the same atomic commit.
+    pub fn apply_rename(&self, src: &str, dst: &str, replace_if_exists: bool) -> Result<()> {
         if !self.dev.is_writable() {
             return Err(Error::ReadOnly);
         }
@@ -3292,10 +3706,10 @@ impl Filesystem {
         }
 
         let src_ino = self.find_entry_in_dir(&src_parent_inode, src_name.as_bytes())?;
-        if self
+        let existing_dst_ino = self
             .find_entry_in_dir(&dst_parent_inode, dst_name.as_bytes())
-            .is_ok()
-        {
+            .ok();
+        if existing_dst_ino.is_some() && !replace_if_exists {
             return Err(Error::AlreadyExists);
         }
 
@@ -3321,6 +3735,227 @@ impl Filesystem {
             _ => crate::dir::DirEntryType::Unknown,
         };
 
+        // ===================================================================
+        // Replace-overwrite branch — dst already exists and caller opted in.
+        // ===================================================================
+        if let Some(dst_old_ino) = existing_dst_ino {
+            // Hardlink case: src and dst already share an inode. POSIX
+            // rename(2) requires this to be a no-op success — entry count
+            // is unchanged, and removing src would unconditionally drop the
+            // shared link count by one which is wrong.
+            if dst_old_ino == src_ino {
+                return Ok(());
+            }
+
+            let (dst_old_inode, mut dst_old_raw) = self.read_inode_verified(dst_old_ino)?;
+            let dst_is_dir = dst_old_inode.is_dir();
+
+            // Type compatibility — rename(2) forbids crossing the
+            // file/directory boundary.
+            if !src_is_dir && dst_is_dir {
+                return Err(Error::IsADirectory);
+            }
+            if src_is_dir && !dst_is_dir {
+                return Err(Error::NotADirectory);
+            }
+
+            // Non-empty-dir overwrite is forbidden by POSIX. Walk every
+            // block of dst and reject any entry that isn't `.` / `..`.
+            if dst_is_dir {
+                let bs = self.sb.block_size();
+                let has_ft =
+                    self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
+                let blocks = dst_old_inode.size.div_ceil(bs as u64);
+                for logical in 0..blocks {
+                    let Some(phys) = crate::extent::map_logical(
+                        &dst_old_inode.block,
+                        self.dev.as_ref(),
+                        bs,
+                        logical,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let block = self.read_block(phys)?;
+                    for entry in crate::dir::DirBlockIter::new(&block, has_ft) {
+                        let e = entry?;
+                        if e.name != b"." && e.name != b".." {
+                            return Err(Error::DirectoryNotEmpty);
+                        }
+                    }
+                }
+            }
+
+            // Stage the whole overwrite into a single buffer so a crash
+            // either fully replaces dst or leaves the FS in its prior
+            // state.
+            let mut buf = BlockBuffer::new(self.sb.block_size());
+
+            // 1. Pop the existing dst entry from dst_parent so the
+            //    in-place add below has somewhere to land.
+            self.buffer_remove_dir_entry(
+                &mut buf,
+                dst_parent_ino,
+                &dst_parent_inode,
+                dst_name.as_bytes(),
+            )?;
+
+            // 2. Add the new dst entry pointing at src_ino. Try in-place
+            //    first; if no block has room, mirror the dst_extends
+            //    fall-back from the non-replace path.
+            let dst_extends = match self.buffer_add_dir_entry_inplace(
+                &mut buf,
+                dst_parent_ino,
+                &dst_parent_inode,
+                dst_name.as_bytes(),
+                src_ino,
+                dir_type,
+            ) {
+                Ok(()) => false,
+                Err(Error::OutOfBounds) => true,
+                Err(e) => return Err(e),
+            };
+            if dst_extends {
+                // Commit removal (and any prior in-buffer mutations) so
+                // the un-journaled extend doesn't race with replays.
+                self.commit_block_buffer(buf)?;
+                self.extend_dir_and_add_entry(
+                    dst_parent_ino,
+                    dst_name.as_bytes(),
+                    src_ino,
+                    dir_type,
+                )?;
+                buf = BlockBuffer::new(self.sb.block_size());
+            }
+
+            // 3. Remove src entry from its parent.
+            self.buffer_remove_dir_entry(
+                &mut buf,
+                src_parent_ino,
+                &src_parent_inode,
+                src_name.as_bytes(),
+            )?;
+
+            // 4. Cross-parent dir move: fix `..` + parent nlinks.
+            //    For dir-replaces-dir the dst_parent gains the moved
+            //    subdir but loses the dropped subdir → net zero. The
+            //    -1 for the dropped subdir is applied below in the reap
+            //    branch; suppress the +1 here when we'd otherwise apply
+            //    both.
+            if src_is_dir && src_parent_ino != dst_parent_ino {
+                self.buffer_update_dotdot(&mut buf, src_ino, &src_inode, dst_parent_ino)?;
+
+                // Source parent loses one subdir → -1 nlink.
+                let (sp_inode, mut sp_raw) = self.read_inode_verified(src_parent_ino)?;
+                self.patch_inode_nlink(src_parent_ino, &mut sp_raw, &sp_inode, -1)?;
+                self.buffer_write_inode(&mut buf, src_parent_ino, &sp_raw)?;
+
+                // Dest parent: only bump if NOT replacing a dir (which
+                // would offset the bump). With dir-replaces-dir the
+                // dropped subdir's -1 happens below, balancing the +1.
+                if !dst_is_dir {
+                    let (dp_inode, mut dp_raw) = self.read_inode_verified(dst_parent_ino)?;
+                    self.patch_inode_nlink(dst_parent_ino, &mut dp_raw, &dp_inode, 1)?;
+                    self.buffer_write_inode(&mut buf, dst_parent_ino, &dp_raw)?;
+                }
+            }
+
+            // 5. Decrement dst_old_ino's link count. If it hits zero,
+            //    free its data extents + inode slot in this same buffer.
+            //    Directories always reap (they only ever have one external
+            //    name in our v1 — directory hardlinks aren't supported).
+            let new_links = dst_old_inode.links_count.saturating_sub(1);
+            if new_links > 0 && !dst_is_dir {
+                // Hardlinked file overwrite — just persist the new count.
+                dst_old_raw[0x1A..0x1C].copy_from_slice(&new_links.to_le_bytes());
+                self.finalize_inode_raw(dst_old_ino, dst_old_inode.generation, &mut dst_old_raw)?;
+                self.buffer_write_inode(&mut buf, dst_old_ino, &dst_old_raw)?;
+            } else {
+                let bs = self.sb.block_size();
+                let sectors_per_block = bs as u64 / 512;
+                let mut freed_sectors: u64 = 0;
+                if dst_old_inode.has_extents() && dst_old_inode.size > 0 {
+                    if dst_is_dir {
+                        // Directory data blocks aren't tracked through
+                        // plan_truncate_shrink (that path expects regular
+                        // files); use extent::collect_all + free per run.
+                        let extents = crate::extent::collect_all(
+                            &dst_old_inode.block,
+                            self.dev.as_ref(),
+                            bs,
+                        )?;
+                        for e in &extents {
+                            self.buffer_free_block_run_and_bgd(
+                                &mut buf,
+                                e.physical_block,
+                                e.length as u64,
+                            )?;
+                            freed_sectors += e.length as u64 * sectors_per_block;
+                        }
+                    } else {
+                        let (_sc, muts) = crate::file_mut::plan_truncate_shrink(
+                            dst_old_inode.size,
+                            0,
+                            &dst_old_inode.block,
+                            bs,
+                        )?;
+                        for m in &muts {
+                            if let crate::extent_mut::ExtentMutation::FreePhysicalRun {
+                                start,
+                                len,
+                            } = m
+                            {
+                                self.buffer_free_block_run_and_bgd(
+                                    &mut buf,
+                                    *start,
+                                    *len as u64,
+                                )?;
+                                freed_sectors += *len as u64 * sectors_per_block;
+                            }
+                        }
+                    }
+                }
+
+                self.buffer_free_inode_slot(&mut buf, dst_old_ino)?;
+                if dst_is_dir {
+                    // Reaped a directory → bg_used_dirs_count -= 1.
+                    let dst_old_gi =
+                        ((dst_old_ino - 1) / self.sb.inodes_per_group) as usize;
+                    self.buffer_patch_bgd_counters(&mut buf, dst_old_gi, 0, 0, -1)?;
+                }
+                let freed_blocks =
+                    freed_sectors.checked_div(sectors_per_block).unwrap_or(0);
+                self.buffer_patch_sb_counters(&mut buf, freed_blocks as i64, 1)?;
+
+                // Zero the inode body, set dtime = now, preserve generation.
+                let inode_size = self.sb.inode_size as usize;
+                let old_gen = dst_old_inode.generation;
+                for b in &mut dst_old_raw[..inode_size] {
+                    *b = 0;
+                }
+                let dtime = now_unix_seconds();
+                dst_old_raw[0x14..0x18].copy_from_slice(&dtime.to_le_bytes());
+                dst_old_raw[0x64..0x68].copy_from_slice(&old_gen.to_le_bytes());
+                self.finalize_inode_raw(dst_old_ino, old_gen, &mut dst_old_raw)?;
+                self.buffer_write_inode(&mut buf, dst_old_ino, &dst_old_raw)?;
+
+                // Dir-replaces-dir: dst_parent loses the removed subdir's
+                // `..` reference → -1 nlink. Skipped for the cross-parent
+                // dir move (the +1 above was already suppressed, so the
+                // two deltas cancel without further work).
+                if dst_is_dir && !(src_is_dir && src_parent_ino != dst_parent_ino) {
+                    let (dp_inode, mut dp_raw) = self.read_inode_verified(dst_parent_ino)?;
+                    self.patch_inode_nlink(dst_parent_ino, &mut dp_raw, &dp_inode, -1)?;
+                    self.buffer_write_inode(&mut buf, dst_parent_ino, &dp_raw)?;
+                }
+            }
+
+            return self.commit_block_buffer(buf);
+        }
+
+        // ===================================================================
+        // No-overwrite path — dst doesn't exist. Mirrors the v1 behaviour.
+        // ===================================================================
         // Multi-block transaction: insert dst entry + remove src entry +
         // (cross-parent dir) update .. + adjust parent nlinks. Atomic so
         // a crash either fully renames or leaves the original.

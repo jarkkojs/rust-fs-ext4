@@ -46,7 +46,7 @@
 
 use crate::block_io::{BlockDevice, CallbackDevice, FileDevice};
 use crate::dir::{self, DirBlockIter, DirEntryType};
-use crate::error::errno::{EINVAL, EISDIR, ENOENT, ENOSYS, ENOTDIR};
+use crate::error::errno::{EINVAL, EISDIR, ENAMETOOLONG, ENOENT, ENOSYS, ENOTDIR};
 use crate::error::{Error, Result};
 use crate::extent;
 use crate::features;
@@ -1655,6 +1655,86 @@ pub unsafe extern "C" fn fs_ext4_write_file(
     )
 }
 
+/// Positional write: splice `len` bytes from `data` into `path` at byte
+/// `offset`. Allocates new physical blocks for any logical blocks not yet
+/// mapped (sparse holes / past EOF). Existing mapped blocks are read-
+/// modify-written for partial overlap; full-block writes go in fresh.
+///
+/// This is the streaming-write primitive — it costs O(len), not
+/// O(filesize). The streaming write paths in FUSE / WinFsp / FSKit
+/// adapters should use this instead of `fs_ext4_write_file` (which is
+/// the "save-as" / whole-file-replace primitive).
+///
+/// Returns the new file size on success, -1 on failure (errno via
+/// `fs_ext4_last_errno()`, message via `fs_ext4_last_error()`). The file
+/// must already exist; create-then-pwrite is the standard streaming
+/// pattern.
+///
+/// Hard cap on `len`: 1 GiB per call (matches `fs_ext4_write_file`).
+/// Streaming writers should chunk above that — typical FS adapters
+/// dispatch at most ~1 MiB anyway.
+///
+/// v1 limitations are documented on `Filesystem::apply_pwrite`.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_pwrite(
+    fs: *mut fs_ext4_fs_t,
+    path: *const c_char,
+    data: *const c_void,
+    len: u64,
+    offset: u64,
+) -> i64 {
+    ffi_guard(
+        -1i64,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return -1;
+            }
+            if data.is_null() && len > 0 {
+                set_err_msg("null data with non-zero len", EINVAL);
+                return -1;
+            }
+            // Same hard cap as `fs_ext4_write_file` to defang a hostile
+            // caller passing `len = u64::MAX` — constructing `&[u8]` from
+            // raw parts with a length larger than the caller's buffer is
+            // UB even before any read happens.
+            const MAX_PWRITE_LEN: u64 = 1 << 30;
+            if len > MAX_PWRITE_LEN {
+                set_err_msg(
+                    &format!("pwrite: len {len} exceeds {MAX_PWRITE_LEN}"),
+                    EINVAL,
+                );
+                return -1;
+            }
+            // offset+len overflow: catch here so the FS-layer error has
+            // a clear FFI-level message rather than "offset+len overflow"
+            // surfaced from deep inside path handling.
+            if offset.checked_add(len).is_none() {
+                set_err_msg("pwrite: offset+len overflow", EINVAL);
+                return -1;
+            }
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            let slice: &[u8] = if len == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(data as *const u8, len as usize)
+            };
+            match fs_ref.apply_pwrite(path_str, offset, slice) {
+                Ok(new_size) => new_size as i64,
+                Err(e) => {
+                    set_err_from(
+                        &e,
+                        &format!("pwrite {path_str} @{offset}+{len}"),
+                    );
+                    -1
+                }
+            }
+        }),
+    )
+}
+
 /// Mount an ext4 filesystem read-write. Companion to `fs_ext4_mount`.
 /// Returns NULL on failure. A successful mount will replay a dirty journal
 /// before returning.
@@ -1722,7 +1802,8 @@ pub unsafe extern "C" fn fs_ext4_link(
 /// Rename / move `src` → `dst` within this mount. Works for files and
 /// directories; cross-parent moves fix the moved dir's `..` entry and
 /// adjust both parents' `i_links_count`. Dest must NOT already exist —
-/// overwrite-on-rename is a follow-up. Returns 0 on success, -1 on failure.
+/// for atomic overwrite use `fs_ext4_rename2` with the
+/// `FS_EXT4_RENAME_REPLACE` flag. Returns 0 on success, -1 on failure.
 #[no_mangle]
 pub unsafe extern "C" fn fs_ext4_rename(
     fs: *mut fs_ext4_fs_t,
@@ -1740,10 +1821,64 @@ pub unsafe extern "C" fn fs_ext4_rename(
             let fs_ref = &(*fs).fs;
             let src_str = cstr_to_str(src);
             let dst_str = cstr_to_str(dst);
-            match fs_ref.apply_rename(src_str, dst_str) {
+            match fs_ref.apply_rename(src_str, dst_str, false) {
                 Ok(()) => 0,
                 Err(e) => {
                     set_err_from(&e, &format!("rename {src_str} -> {dst_str}"));
+                    -1
+                }
+            }
+        }),
+    )
+}
+
+/// `fs_ext4_rename2` flag bits. `FS_EXT4_RENAME_REPLACE` enables
+/// atomic overwrite of an existing destination — required to support
+/// "Save As" / drag-drop-onto-existing on Windows / FUSE callers that
+/// pass the equivalent of `RENAME_EXCHANGE`'s "replace" semantics.
+/// Unknown flag bits are rejected with EINVAL so future flag additions
+/// stay forward-compatible.
+pub const FS_EXT4_RENAME_REPLACE: c_int = 0x01;
+
+/// Rename / move `src` → `dst` within this mount, with explicit flags.
+/// Currently the only flag is `FS_EXT4_RENAME_REPLACE` — when set, an
+/// existing destination is atomically replaced (POSIX `rename(2)`
+/// semantics): file→file overwrites the old file's data and frees its
+/// inode (or decrements link count on a hardlinked target), empty-dir
+/// → empty-dir overwrites the dropped subdir, and crossing the
+/// file/directory boundary returns `EISDIR` / `ENOTDIR`. Without the
+/// flag, behaves identically to `fs_ext4_rename`. Returns 0 on success,
+/// -1 on failure.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_rename2(
+    fs: *mut fs_ext4_fs_t,
+    src: *const c_char,
+    dst: *const c_char,
+    flags: c_int,
+) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || src.is_null() || dst.is_null() {
+                set_err_msg("null fs/src/dst", EINVAL);
+                return -1;
+            }
+            // Reject any flag bits we don't define so future additions
+            // can be detected by callers via EINVAL probing.
+            let known = FS_EXT4_RENAME_REPLACE;
+            if flags & !known != 0 {
+                set_err_msg("rename2: unknown flag bits", EINVAL);
+                return -1;
+            }
+            let replace = flags & FS_EXT4_RENAME_REPLACE != 0;
+            let fs_ref = &(*fs).fs;
+            let src_str = cstr_to_str(src);
+            let dst_str = cstr_to_str(dst);
+            match fs_ref.apply_rename(src_str, dst_str, replace) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("rename2 {src_str} -> {dst_str}"));
                     -1
                 }
             }
@@ -1916,8 +2051,11 @@ pub unsafe extern "C" fn fs_ext4_utimens(
 /// `linkpath` must exist and be a directory; `linkpath` itself must not
 /// already exist.
 ///
-/// v1 limit: `target` must be ≤ 60 bytes (fast-symlink path). Longer
-/// targets return -1 with EINVAL + an explanatory `fs_ext4_last_error`.
+/// Targets <60 bytes use the fast-symlink path (stored inline in the
+/// inode's i_block area). Targets >=60 and <=4096 bytes use the slow path
+/// (one fs block allocated, target stored there, single extent inserted).
+/// Targets longer than 4096 (Linux PATH_MAX) return 0 with errno set to
+/// ENAMETOOLONG via `fs_ext4_last_error`.
 ///
 /// Returns the new inode number on success (> 0), or 0 on failure with
 /// details in `fs_ext4_last_error`.
@@ -1933,6 +2071,33 @@ pub unsafe extern "C" fn fs_ext4_symlink(
             clear_last_error();
             if fs.is_null() || target.is_null() || linkpath.is_null() {
                 set_err_msg("null fs/target/linkpath", EINVAL);
+                return 0u32;
+            }
+            // Length-cap target/linkpath at FFI_PATH_MAX explicitly. The
+            // generic `cstr_to_str` silently returns "" past the cap; for
+            // symlink targets we want the ENAMETOOLONG distinction so that
+            // a hostile caller can't fabricate a multi-megabyte slice and
+            // an honest one with a 5000-byte target sees the right errno.
+            let target_bytes = CStr::from_ptr(target).to_bytes();
+            if target_bytes.len() > FFI_PATH_MAX {
+                set_err_msg(
+                    &format!(
+                        "symlink target length {} exceeds FFI_PATH_MAX {FFI_PATH_MAX}",
+                        target_bytes.len()
+                    ),
+                    ENAMETOOLONG,
+                );
+                return 0u32;
+            }
+            let linkpath_bytes = CStr::from_ptr(linkpath).to_bytes();
+            if linkpath_bytes.len() > FFI_PATH_MAX {
+                set_err_msg(
+                    &format!(
+                        "symlink linkpath length {} exceeds FFI_PATH_MAX {FFI_PATH_MAX}",
+                        linkpath_bytes.len()
+                    ),
+                    ENAMETOOLONG,
+                );
                 return 0u32;
             }
             let fs_ref = &(*fs).fs;

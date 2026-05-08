@@ -159,9 +159,11 @@ fn symlink_slow_path_target_over_60_bytes_roundtrips() {
 }
 
 #[test]
-fn symlink_target_over_255_returns_enametoolong() {
-    // 256 bytes — over POSIX SYMLINK_MAX.
-    let long_target = "x".repeat(256);
+fn symlink_target_over_path_max_returns_enametoolong() {
+    // 5000 bytes — over PATH_MAX (4096) and over the FFI cap. ext4 stores the
+    // slow target inline in one fs block, so anything past block_size is
+    // refused.
+    let long_target = "x".repeat(5000);
     let img = scratch("toolong");
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let target_c = CString::new(long_target.clone()).unwrap();
