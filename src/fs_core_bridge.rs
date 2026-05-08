@@ -26,15 +26,15 @@ use crate::error::Error;
 /// Lift an ext4 error into the unified `fs_core::Error` shape so trait
 /// methods can return the framework's error type. Lossy on variants
 /// without a direct counterpart — those flatten to `Custom(String)`.
+///
+/// `Error::OutOfBounds` deliberately flattens to `Custom` rather than
+/// `fs_core::Error::OutOfBounds { offset, len, size }`: ext4's error type
+/// doesn't carry the offset/len/size context, so synthesising zeros here
+/// would silently mislead consumers pattern-matching on those fields.
 fn ext4_to_fs_core_error(e: Error) -> fs_core::Error {
     match e {
         Error::Io(io) => fs_core::Error::Io(io),
         Error::ReadOnly => fs_core::Error::ReadOnly,
-        Error::OutOfBounds => fs_core::Error::OutOfBounds {
-            offset: 0,
-            len: 0,
-            size: 0,
-        },
         other => fs_core::Error::Custom(format!("{other:?}")),
     }
 }
@@ -69,6 +69,14 @@ impl fs_core::BlockRead for FileDevice {
 
 impl fs_core::BlockDevice for FileDevice {
     fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        // Short-circuit on the writable bit so RO devices surface
+        // `fs_core::Error::ReadOnly` consistently. The inner write_at
+        // would otherwise return `Error::Corrupt("FileDevice opened
+        // read-only")`, which our error map flattens to `Custom`,
+        // breaking the `is_writable()` / `write_at` contract.
+        if !BlockDevice::is_writable(self) {
+            return Err(fs_core::Error::ReadOnly);
+        }
         BlockDevice::write_at(self, offset, buf).map_err(ext4_to_fs_core_error)
     }
     fn flush(&self) -> fs_core::Result<()> {
@@ -90,6 +98,14 @@ impl fs_core::BlockRead for CallbackDevice {
 
 impl fs_core::BlockDevice for CallbackDevice {
     fn write_at(&self, offset: u64, buf: &[u8]) -> fs_core::Result<()> {
+        // Same RO short-circuit as the FileDevice impl above — without
+        // it, callback devices configured with `write: None` surface
+        // their `Error::Corrupt("CallbackDevice has no write
+        // callback")` as `fs_core::Error::Custom`, which breaks
+        // `is_writable()` / `write_at` consistency.
+        if !BlockDevice::is_writable(self) {
+            return Err(fs_core::Error::ReadOnly);
+        }
         BlockDevice::write_at(self, offset, buf).map_err(ext4_to_fs_core_error)
     }
     fn flush(&self) -> fs_core::Result<()> {
@@ -183,6 +199,17 @@ mod tests {
             let mut b = self.0.lock().unwrap();
             let start = offset as usize;
             let end = start + buf.len();
+            // Honest BlockDevice impl: out-of-range writes return
+            // `fs_core::Error::OutOfBounds` rather than panicking from
+            // a slice copy_from_slice. Without this guard, future
+            // tests that exercise the error path would panic instead.
+            if end > b.len() {
+                return Err(fs_core::Error::OutOfBounds {
+                    offset,
+                    len: buf.len() as u64,
+                    size: b.len() as u64,
+                });
+            }
             b[start..end].copy_from_slice(buf);
             Ok(())
         }
