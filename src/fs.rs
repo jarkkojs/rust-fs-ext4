@@ -2646,8 +2646,7 @@ impl Filesystem {
         // Phase-2 writes for these MUST NOT read from disk (the prior
         // contents of those physical blocks are stale junk from whoever
         // freed them last); they get a zero-init buffer instead.
-        let mut newly_alloc: std::collections::BTreeSet<u64> =
-            std::collections::BTreeSet::new();
+        let mut newly_alloc: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         let mut alloc_total_blocks: u64 = 0;
 
         // Phase 1: walk affected logical blocks; allocate each contiguous
@@ -2717,9 +2716,7 @@ impl Filesystem {
                     };
                     match plan_result {
                         Ok(p) => break p,
-                        Err(Error::Corrupt(msg))
-                            if msg.contains("contiguous free run") =>
-                        {
+                        Err(Error::Corrupt(msg)) if msg.contains("contiguous free run") => {
                             if want == 1 {
                                 // Even a single block isn't available
                                 // anywhere — true ENOSPC.
@@ -2788,15 +2785,12 @@ impl Filesystem {
                         let deep_plan = {
                             let mut alloc_closure = || -> Result<u64> {
                                 let p = {
-                                    let mut bitmap_reader =
-                                        |b: u64| -> Result<Vec<u8>> {
-                                            if let Some(bytes) =
-                                                buf.dirty.get(&b)
-                                            {
-                                                return Ok(bytes.clone());
-                                            }
-                                            self.read_block(b)
-                                        };
+                                    let mut bitmap_reader = |b: u64| -> Result<Vec<u8>> {
+                                        if let Some(bytes) = buf.dirty.get(&b) {
+                                            return Ok(bytes.clone());
+                                        }
+                                        self.read_block(b)
+                                    };
                                     crate::alloc::plan_block_allocation(
                                         &self.sb,
                                         &self.groups,
@@ -2805,11 +2799,7 @@ impl Filesystem {
                                         &mut bitmap_reader,
                                     )?
                                 };
-                                self.buffer_mark_block_run_used(
-                                    &mut buf,
-                                    p.first_block,
-                                    1,
-                                )?;
+                                self.buffer_mark_block_run_used(&mut buf, p.first_block, 1)?;
                                 self.buffer_patch_bgd_counters(
                                     &mut buf,
                                     p.bgd.group_idx as usize,
@@ -2833,11 +2823,8 @@ impl Filesystem {
                         for (block, bytes) in deep_plan.block_writes {
                             let mut bytes = bytes;
                             if self.csum.enabled {
-                                self.csum.patch_extent_tail(
-                                    ino,
-                                    inode_generation,
-                                    &mut bytes,
-                                );
+                                self.csum
+                                    .patch_extent_tail(ino, inode_generation, &mut bytes);
                             }
                             // Eager-write tree-meta blocks to disk so a
                             // *subsequent* plan_insert_extent_deep within
@@ -2903,7 +2890,9 @@ impl Filesystem {
                 // bytes (head before `chunk_start`, tail after `chunk_end`).
                 let block = buf.get_mut(self, phys)?;
                 if block.len() != bs_usize {
-                    return Err(Error::Corrupt("pwrite Phase 2: existing block has wrong size"));
+                    return Err(Error::Corrupt(
+                        "pwrite Phase 2: existing block has wrong size",
+                    ));
                 }
                 block[in_block_off..in_block_off + chunk_len]
                     .copy_from_slice(&data[data_off..data_off + chunk_len]);
@@ -3763,8 +3752,7 @@ impl Filesystem {
             // block of dst and reject any entry that isn't `.` / `..`.
             if dst_is_dir {
                 let bs = self.sb.block_size();
-                let has_ft =
-                    self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
+                let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
                 let blocks = dst_old_inode.size.div_ceil(bs as u64);
                 for logical in 0..blocks {
                     let Some(phys) = crate::extent::map_logical(
@@ -3905,11 +3893,7 @@ impl Filesystem {
                                 len,
                             } = m
                             {
-                                self.buffer_free_block_run_and_bgd(
-                                    &mut buf,
-                                    *start,
-                                    *len as u64,
-                                )?;
+                                self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
                                 freed_sectors += *len as u64 * sectors_per_block;
                             }
                         }
@@ -3919,12 +3903,10 @@ impl Filesystem {
                 self.buffer_free_inode_slot(&mut buf, dst_old_ino)?;
                 if dst_is_dir {
                     // Reaped a directory → bg_used_dirs_count -= 1.
-                    let dst_old_gi =
-                        ((dst_old_ino - 1) / self.sb.inodes_per_group) as usize;
+                    let dst_old_gi = ((dst_old_ino - 1) / self.sb.inodes_per_group) as usize;
                     self.buffer_patch_bgd_counters(&mut buf, dst_old_gi, 0, 0, -1)?;
                 }
-                let freed_blocks =
-                    freed_sectors.checked_div(sectors_per_block).unwrap_or(0);
+                let freed_blocks = freed_sectors.checked_div(sectors_per_block).unwrap_or(0);
                 self.buffer_patch_sb_counters(&mut buf, freed_blocks as i64, 1)?;
 
                 // Zero the inode body, set dtime = now, preserve generation.

@@ -49,15 +49,8 @@ fn last_err() -> String {
 fn read_full(fs_h: *mut fs_ext4_fs_t, path: &str, size: u64) -> Vec<u8> {
     let cp = CString::new(path).unwrap();
     let mut buf = vec![0u8; size as usize];
-    let n = unsafe {
-        fs_ext4_read_file(
-            fs_h,
-            cp.as_ptr(),
-            buf.as_mut_ptr() as *mut c_void,
-            0,
-            size,
-        )
-    };
+    let n =
+        unsafe { fs_ext4_read_file(fs_h, cp.as_ptr(), buf.as_mut_ptr() as *mut c_void, 0, size) };
     assert!(
         n >= 0,
         "read_file({path}, 0, {size}) failed: rc={n}, err={}",
@@ -92,7 +85,9 @@ fn sequential_chunks_match_whole_file() {
 
     // Synthetic payload: deterministic + non-aligned-friendly. 1 MiB total.
     let total: usize = 1 << 20;
-    let payload: Vec<u8> = (0..total).map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8).collect();
+    let payload: Vec<u8> = (0..total)
+        .map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8)
+        .collect();
 
     let chunk: usize = 64 * 1024;
     let mut written: usize = 0;
@@ -422,15 +417,7 @@ fn pwrite_zero_len_is_noop() {
     };
     assert!(rc >= 0);
 
-    let rc = unsafe {
-        fs_ext4_pwrite(
-            fs_h,
-            path.as_ptr(),
-            std::ptr::null(),
-            0,
-            999,
-        )
-    };
+    let rc = unsafe { fs_ext4_pwrite(fs_h, path.as_ptr(), std::ptr::null(), 0, 999) };
     assert!(rc >= 0, "zero-len pwrite at any offset must succeed");
     assert_eq!(rc as u64, seed.len() as u64, "size unchanged");
 

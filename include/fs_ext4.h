@@ -206,6 +206,29 @@ struct FsCoreDevice;
 fs_ext4_fs_t *fs_ext4_mount_with_fs_core_device(struct FsCoreDevice *handle);
 
 /*
+ * Same as fs_ext4_mount_with_fs_core_device but defers journal replay.
+ * Use this when the embedding context cannot tolerate replay running
+ * synchronously inside the mount call — typically because the device
+ * handle isn't fully writable until the mount call has returned.
+ *
+ * After mount, call `fs_ext4_replay_journal_if_dirty(fs)` once the
+ * underlying write path is ready. Until journal replay runs, the
+ * mounted state may reflect a partially-applied journal — readers
+ * see what's on disk, not the post-replay view. Writes through the
+ * crate will fail until replay completes.
+ *
+ * Same handle-ownership semantics as fs_ext4_mount_with_fs_core_device:
+ * the handle's reference count is incremented internally; the caller
+ * still owns their *FsCoreDevice and frees it via
+ * `fs_core_device_close`. Closing the resulting fs_ext4_fs_t via
+ * `fs_ext4_umount` drops the mount's own reference.
+ *
+ * Returns NULL on failure; use fs_ext4_last_error() / fs_ext4_last_errno()
+ * for detail.
+ */
+fs_ext4_fs_t *fs_ext4_mount_with_fs_core_device_lazy(struct FsCoreDevice *handle);
+
+/*
  * Mount an ext4 filesystem read-write using callback-based I/O.
  * Companion to fs_ext4_mount_rw — same behaviour (replays a dirty journal
  * before returning), but the device is reached through caller-supplied

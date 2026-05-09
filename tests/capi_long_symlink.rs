@@ -226,9 +226,7 @@ fn slow_path_200_byte_target_roundtrips() {
 
 #[test]
 fn slow_path_1000_byte_target_roundtrips() {
-    let target: String = (0..1000)
-        .map(|i| (b'A' + (i as u8 % 26)) as char)
-        .collect();
+    let target: String = (0..1000).map(|i| (b'A' + (i as u8 % 26)) as char).collect();
     assert_eq!(target.len(), 1000);
 
     let img = scratch("slow1000");
@@ -325,9 +323,7 @@ fn slow_symlink_survives_csum_validated_remount() {
 
 #[test]
 fn slow_symlink_1000_bytes_survives_remount() {
-    let target: String = (0..1000)
-        .map(|i| (b'a' + (i as u8 % 26)) as char)
-        .collect();
+    let target: String = (0..1000).map(|i| (b'a' + (i as u8 % 26)) as char).collect();
 
     let img = scratch("remount_1k");
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
