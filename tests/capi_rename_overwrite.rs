@@ -70,12 +70,7 @@ fn create_file_with_content(fs: *mut fs_ext4_fs_t, path: &str, content: &[u8]) {
                 content.len() as u64,
             )
         };
-        assert_eq!(
-            rc,
-            content.len() as i64,
-            "write {path}: {}",
-            last_err_str()
-        );
+        assert_eq!(rc, content.len() as i64, "write {path}: {}", last_err_str());
     }
 }
 
@@ -150,7 +145,12 @@ fn file_replace_file_without_replace_flag_returns_eexist() {
     // /test.txt exists on the fixture.
     let rc = rename2(fs, "/src.txt", "/test.txt", 0);
     assert_eq!(rc, -1);
-    assert_eq!(fs_ext4_last_errno(), 17, "expected EEXIST: {}", last_err_str());
+    assert_eq!(
+        fs_ext4_last_errno(),
+        17,
+        "expected EEXIST: {}",
+        last_err_str()
+    );
     // Bare fs_ext4_rename also still returns EEXIST.
     let s = CString::new("/src.txt").unwrap();
     let d = CString::new("/test.txt").unwrap();
@@ -229,12 +229,7 @@ fn file_replace_dir_returns_eisdir() {
     let dst = CString::new("/some_dir").unwrap();
     let _ = unsafe { fs_ext4_mkdir(fs, dst.as_ptr(), 0o755) };
 
-    let rc = rename2(
-        fs,
-        "/just_a_file.txt",
-        "/some_dir",
-        FS_EXT4_RENAME_REPLACE,
-    );
+    let rc = rename2(fs, "/just_a_file.txt", "/some_dir", FS_EXT4_RENAME_REPLACE);
     assert_eq!(rc, -1);
     assert_eq!(
         fs_ext4_last_errno(),
