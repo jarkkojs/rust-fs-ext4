@@ -206,6 +206,14 @@ struct FsCoreDevice;
 fs_ext4_fs_t *fs_ext4_mount_with_fs_core_device(struct FsCoreDevice *handle);
 
 /*
+ * Same as fs_ext4_mount_with_fs_core_device but defers journal replay.
+ * Use from FSKit loadResource paths where replay during the load call
+ * can hang. After the volume is fully active, invoke
+ * fs_ext4_replay_journal_if_dirty() to drain the journal.
+ */
+fs_ext4_fs_t *fs_ext4_mount_with_fs_core_device_lazy(struct FsCoreDevice *handle);
+
+/*
  * Mount an ext4 filesystem read-write using callback-based I/O.
  * Companion to fs_ext4_mount_rw — same behaviour (replays a dirty journal
  * before returning), but the device is reached through caller-supplied

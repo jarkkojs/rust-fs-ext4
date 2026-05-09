@@ -533,6 +533,37 @@ pub unsafe extern "C" fn fs_ext4_mount_with_fs_core_device(
     )
 }
 
+/// Same as [`fs_ext4_mount_with_fs_core_device`] but defers journal replay
+/// until the caller invokes [`fs_ext4_replay_journal_if_dirty`]. Use this
+/// from FSKit `loadResource` paths where replaying mid-load can hang the
+/// mount call — replay can run safely once the volume is fully active.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_mount_with_fs_core_device_lazy(
+    handle: *mut fs_core::ffi::FsCoreDevice,
+) -> *mut fs_ext4_fs_t {
+    ffi_guard(
+        std::ptr::null_mut(),
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if handle.is_null() {
+                set_err_msg("null fs_core handle", EINVAL);
+                return std::ptr::null_mut();
+            }
+            let inner = (*handle).inner().clone();
+            let adapter = crate::fs_core_bridge::CoreDevice::new(inner);
+            let dev: Arc<dyn BlockDevice> = Arc::new(adapter);
+
+            match Filesystem::mount_lazy(dev) {
+                Ok(fs) => Box::into_raw(Box::new(fs_ext4_fs_t { fs })),
+                Err(e) => {
+                    set_err_from(&e, "mount_lazy via fs_core handle");
+                    std::ptr::null_mut()
+                }
+            }
+        }),
+    )
+}
+
 /// Mount read-write via caller-supplied read+write callbacks. Companion to
 /// `fs_ext4_mount_rw` for sandboxed consumers (FSKit, etc.) that own a
 /// block-device resource but cannot open `/dev/diskN`. Both `cfg.read`
@@ -1765,10 +1796,7 @@ pub unsafe extern "C" fn fs_ext4_pwrite(
             match fs_ref.apply_pwrite(path_str, offset, slice) {
                 Ok(new_size) => new_size as i64,
                 Err(e) => {
-                    set_err_from(
-                        &e,
-                        &format!("pwrite {path_str} @{offset}+{len}"),
-                    );
+                    set_err_from(&e, &format!("pwrite {path_str} @{offset}+{len}"));
                     -1
                 }
             }
