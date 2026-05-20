@@ -84,4 +84,12 @@ jobs:
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish
+        # `--locked` makes cargo refuse to silently update Cargo.lock
+        # during publish-verify. If the lockfile committed at the tag
+        # doesn't match the resolver's view of the current index +
+        # path-pinned siblings, the job fails loudly here rather than
+        # publishing a divergent artifact. Discipline: any time
+        # Cargo.toml's `version` changes, regenerate the lockfile
+        # (`cargo update --workspace`) and commit it in the same
+        # release prep.
+        run: cargo publish --locked
