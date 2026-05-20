@@ -198,8 +198,12 @@ fn create_sets_timestamps_to_now() {
         .as_secs() as u32
         + 1;
 
-    for (label, ts) in [("atime", a.atime), ("mtime", a.mtime),
-                        ("ctime", a.ctime), ("crtime", a.crtime)] {
+    for (label, ts) in [
+        ("atime", a.atime),
+        ("mtime", a.mtime),
+        ("ctime", a.ctime),
+        ("crtime", a.crtime),
+    ] {
         assert!(
             ts >= before && ts <= after,
             "{label}={ts} outside [{before}, {after}]"

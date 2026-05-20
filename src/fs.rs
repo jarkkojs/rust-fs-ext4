@@ -2142,10 +2142,10 @@ impl Filesystem {
         raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
         raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
-        // i_crtime at 0x90 — birth time. Only valid on inodes with the
-        // extra section (i_extra_isize covers it); 256-byte modern ext4
-        // inodes meet that bar. Without this, `stat -f %B` on darwin /
-        // st_birthtime returns the Unix epoch (1970-01-01).
+                                                             // i_crtime at 0x90 — birth time. Only valid on inodes with the
+                                                             // extra section (i_extra_isize covers it); 256-byte modern ext4
+                                                             // inodes meet that bar. Without this, `stat -f %B` on darwin /
+                                                             // st_birthtime returns the Unix epoch (1970-01-01).
         if inode_size >= 0x94 {
             raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
         }
@@ -2222,7 +2222,7 @@ impl Filesystem {
         raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
         raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
-        // i_crtime at 0x90 — see build_fast_symlink_inode for rationale.
+                                                             // i_crtime at 0x90 — see build_fast_symlink_inode for rationale.
         if inode_size >= 0x94 {
             raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
         }
@@ -2288,10 +2288,10 @@ impl Filesystem {
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
         raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
                                                              // dtime stays zero (not deleted).
-        // i_crtime at 0x90 — birth time. Only valid on inodes with the
-        // extra section (i_extra_isize covers it); 256-byte modern ext4
-        // inodes meet that bar. Without this, `stat -f %B` on darwin /
-        // st_birthtime returns the Unix epoch (1970-01-01).
+                                                             // i_crtime at 0x90 — birth time. Only valid on inodes with the
+                                                             // extra section (i_extra_isize covers it); 256-byte modern ext4
+                                                             // inodes meet that bar. Without this, `stat -f %B` on darwin /
+                                                             // st_birthtime returns the Unix epoch (1970-01-01).
         if inode_size >= 0x94 {
             raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
         }
