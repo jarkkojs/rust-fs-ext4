@@ -11,7 +11,16 @@
 # capi_* test suite depend on the exact content written here.
 
 set -eu
-cd /host
+
+# Optional first argument: output directory (defaults to /host so the
+# existing one-shot batch mode is unchanged). Subsequent arguments are
+# the image types to build (same as before). Accepting an output dir
+# lets the persistent-VM caller write images into per-run subdirectories:
+#   sh /host/_vm-builder.sh /host/{run_id} basic
+OUTPUT_DIR="${1:-/host}"
+shift 2>/dev/null || true
+mkdir -p "$OUTPUT_DIR"
+cd "$OUTPUT_DIR"
 
 mkdir -p /mnt/img
 
