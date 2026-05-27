@@ -51,12 +51,21 @@ ALPINE_REL="${ALPINE_VER%.*}"
 ALPINE_ISO="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/releases/x86_64/alpine-virt-${ALPINE_VER}-x86_64.iso"
 ALPINE_MAIN="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/main/x86_64"
 
-# Pinned package versions for attr + acl (not in the virt ISO's
-# embedded apk cache; downloaded separately and extracted in-place).
+# Pinned package versions for extra tools not in the virt ISO's
+# embedded apk cache; downloaded separately and extracted in-place.
 ATTR_APK="attr-2.5.2-r2.apk"
 LIBATTR_APK="libattr-2.5.2-r2.apk"
 ACL_APK="acl-2.3.2-r1.apk"
 ACL_LIBS_APK="acl-libs-2.3.2-r1.apk"
+# sfdisk + losetup (util-linux splits) for whole-disk GPT image builds.
+# libfdisk/libsmartcols/libncursesw are their shared-library deps.
+# libblkid and libuuid are already present (pulled in by e2fsprogs).
+SFDISK_APK="sfdisk-2.40.4-r1.apk"
+LOSETUP_APK="losetup-2.40.4-r1.apk"
+LIBFDISK_APK="libfdisk-2.40.4-r1.apk"
+LIBSMARTCOLS_APK="libsmartcols-2.40.4-r1.apk"
+LIBNCURSESW_APK="libncursesw-6.5_p20241006-r3.apk"
+NCURSES_TERMINFO_APK="ncurses-terminfo-base-6.5_p20241006-r3.apk"
 
 download_if_missing() {
     local url="$1" out="$2"
@@ -77,10 +86,16 @@ if [ ! -s "$CACHE/vmlinuz-virt" ] || [ ! -s "$CACHE/initramfs-virt" ]; then
 fi
 
 mkdir -p "$CACHE/extra-apks"
-download_if_missing "$ALPINE_MAIN/$ATTR_APK"     "$CACHE/extra-apks/$ATTR_APK"
-download_if_missing "$ALPINE_MAIN/$LIBATTR_APK"  "$CACHE/extra-apks/$LIBATTR_APK"
-download_if_missing "$ALPINE_MAIN/$ACL_APK"      "$CACHE/extra-apks/$ACL_APK"
-download_if_missing "$ALPINE_MAIN/$ACL_LIBS_APK" "$CACHE/extra-apks/$ACL_LIBS_APK"
+download_if_missing "$ALPINE_MAIN/$ATTR_APK"          "$CACHE/extra-apks/$ATTR_APK"
+download_if_missing "$ALPINE_MAIN/$LIBATTR_APK"       "$CACHE/extra-apks/$LIBATTR_APK"
+download_if_missing "$ALPINE_MAIN/$ACL_APK"           "$CACHE/extra-apks/$ACL_APK"
+download_if_missing "$ALPINE_MAIN/$ACL_LIBS_APK"      "$CACHE/extra-apks/$ACL_LIBS_APK"
+download_if_missing "$ALPINE_MAIN/$SFDISK_APK"        "$CACHE/extra-apks/$SFDISK_APK"
+download_if_missing "$ALPINE_MAIN/$LOSETUP_APK"       "$CACHE/extra-apks/$LOSETUP_APK"
+download_if_missing "$ALPINE_MAIN/$LIBFDISK_APK"      "$CACHE/extra-apks/$LIBFDISK_APK"
+download_if_missing "$ALPINE_MAIN/$LIBSMARTCOLS_APK"  "$CACHE/extra-apks/$LIBSMARTCOLS_APK"
+download_if_missing "$ALPINE_MAIN/$LIBNCURSESW_APK"   "$CACHE/extra-apks/$LIBNCURSESW_APK"
+download_if_missing "$ALPINE_MAIN/$NCURSES_TERMINFO_APK" "$CACHE/extra-apks/$NCURSES_TERMINFO_APK"
 
 # ---------------------------------------------------------------------------
 # Step 2 (server mode only) — generate SSH keypair for builder VM access.
