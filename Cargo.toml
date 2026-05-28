@@ -27,6 +27,8 @@ path = "src/bin/mkfs_ext4.rs"
 [dependencies]
 crc32c = "0.6"
 bitflags = "2"
+unicode-normalization = "0.1"
+caseless = "0.2"
 # Block-device trait surface shared with sister crates (qcow2 reader,
 # partition probe, future fs-* drivers). Local path dep until both crates
 # publish; flip to a published version on the first crates.io release.
