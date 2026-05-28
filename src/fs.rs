@@ -4139,9 +4139,18 @@ impl Filesystem {
             );
         }
         if root_header.depth > 1 {
-            return Err(Error::CorruptExtentTree(
-                "extend_dir_and_add_entry: depth > 1 extent trees are not yet supported (leaf-split needed)",
-            ));
+            return self.extend_dir_and_add_entry_deep(
+                parent_ino,
+                &parent_inode,
+                &mut parent_raw,
+                name,
+                target_ino,
+                file_type,
+                has_ft,
+                new_phys,
+                new_extent,
+                plan,
+            );
         }
 
         let (new_root, leaf_meta_alloc) =
@@ -4285,13 +4294,145 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Grow a directory whose extent tree is already at depth ≥ 2.
+    /// Uses `plan_insert_extent_deep` to navigate and split the tree,
+    /// allocating index-node blocks on demand via `plan_block_allocation`.
+    /// The pre-allocated data block `new_phys` is committed first so the
+    /// alloc closure won't re-use it for tree-meta blocks.
+    #[allow(clippy::too_many_arguments)]
+    fn extend_dir_and_add_entry_deep(
+        &self,
+        parent_ino: u32,
+        parent_inode: &Inode,
+        parent_raw: &mut [u8],
+        name: &[u8],
+        target_ino: u32,
+        file_type: crate::dir::DirEntryType,
+        has_ft: bool,
+        new_phys: u64,
+        new_extent: crate::extent::Extent,
+        data_plan: crate::alloc::BlockAllocationPlan,
+    ) -> Result<()> {
+        let bs = self.sb.block_size();
+        let bs_u64 = bs as u64;
+        let parent_group = (parent_ino - 1) / self.sb.inodes_per_group;
+
+        // Commit the pre-allocated data block first so the alloc closure
+        // picks different blocks for tree-meta nodes.
+        self.mark_block_run_used(data_plan.first_block, 1)?;
+        self.patch_bgd_counters(
+            data_plan.bgd.group_idx as usize,
+            data_plan.bgd.free_blocks_delta,
+            data_plan.bgd.free_inodes_delta,
+            data_plan.bgd.used_dirs_delta,
+        )?;
+        self.patch_sb_counters(data_plan.sb.free_blocks_delta, data_plan.sb.free_inodes_delta)?;
+
+        let reader = FsBlockReader { fs: self };
+        let mut meta_block_count: u64 = 0;
+        let mut alloc_fn = || -> Result<u64> {
+            let mut bm_reader = |block: u64| -> Result<Vec<u8>> {
+                let mut buf = vec![0u8; bs as usize];
+                self.dev.read_at(block * bs_u64, &mut buf)?;
+                Ok(buf)
+            };
+            let meta_plan = crate::alloc::plan_block_allocation(
+                &self.sb,
+                &self.groups,
+                1,
+                parent_group,
+                &mut bm_reader,
+            )?;
+            let meta_phys = meta_plan.first_block;
+            self.mark_block_run_used(meta_phys, 1)?;
+            self.patch_bgd_counters(
+                meta_plan.bgd.group_idx as usize,
+                meta_plan.bgd.free_blocks_delta,
+                meta_plan.bgd.free_inodes_delta,
+                meta_plan.bgd.used_dirs_delta,
+            )?;
+            self.patch_sb_counters(
+                meta_plan.sb.free_blocks_delta,
+                meta_plan.sb.free_inodes_delta,
+            )?;
+            meta_block_count += 1;
+            Ok(meta_phys)
+        };
+
+        let deep_plan = crate::extent_mut::plan_insert_extent_deep(
+            &parent_inode.block,
+            new_extent,
+            bs,
+            &reader,
+            &mut alloc_fn,
+        )?;
+
+        // Write tree-meta blocks (rewritten leaves + any new index nodes).
+        for (block, mut bytes) in deep_plan.block_writes {
+            if self.csum.enabled {
+                self.csum
+                    .patch_extent_tail(parent_ino, parent_inode.generation, &mut bytes);
+            }
+            self.dev.write_at(block * bs_u64, &bytes)?;
+        }
+
+        // Patch inode: root bytes, size (+1 data block), i_blocks.
+        Self::patch_inode_block_area(parent_raw, &deep_plan.new_root)?;
+        let new_size = parent_inode.size + bs_u64;
+        let new_blocks =
+            parent_inode.blocks + (bs_u64 / 512) * (1 + meta_block_count);
+        Self::patch_inode_size_and_blocks(parent_raw, new_size, new_blocks)?;
+        if self.csum.enabled {
+            if let Some((lo, hi)) = self
+                .csum
+                .compute_inode_checksum(parent_ino, parent_inode.generation, parent_raw)
+            {
+                parent_raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if parent_raw.len() >= 0x84 {
+                    parent_raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        self.write_inode_raw(parent_ino, parent_raw)?;
+
+        // Seed + write the new data block with the directory entry.
+        let reserved_tail = if self.csum.enabled { 12 } else { 0 };
+        let usable = (bs as usize) - reserved_tail;
+        let mut block = vec![0u8; bs as usize];
+        block[0..4].copy_from_slice(&0u32.to_le_bytes());
+        block[4..6].copy_from_slice(&(usable as u16).to_le_bytes());
+        crate::dir::add_entry_to_block(
+            &mut block,
+            target_ino,
+            name,
+            file_type,
+            has_ft,
+            reserved_tail,
+        )?;
+        if self.csum.enabled && reserved_tail == 12 {
+            let end = block.len();
+            block[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes());
+            block[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes());
+            block[end - 6] = 0;
+            block[end - 5] = 0xDE;
+            let mut c =
+                crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
+            c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
+            c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
+            block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+        }
+        self.dev.write_at(new_phys * bs_u64, &block)?;
+
+        Ok(())
+    }
+
     /// Grow a directory whose extent tree is already at depth 1 (i.e. has
     /// been promoted). The inline root holds a single index entry → one leaf
     /// block. The mutation happens entirely inside the leaf block; the inode
     /// root is unchanged.
     ///
     /// Leaf overflow (>340 entries in a 4 KiB block with csum) returns a
-    /// clean error. True leaf-split / depth-2 promotion is deferred.
+    /// clean error. Callers that hit this should retry via `extend_dir_and_add_entry_deep`.
     #[allow(clippy::too_many_arguments)]
     fn extend_dir_and_add_entry_depth1(
         &self,
