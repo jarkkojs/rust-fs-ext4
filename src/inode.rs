@@ -15,6 +15,34 @@ pub const INODE_BASE_SIZE: usize = 128;
 /// Offset where the i_extra_isize field begins (start of extra section).
 pub const INODE_EXTRA_OFFSET: usize = 128;
 
+// Raw inode field byte offsets (from the start of the on-disk inode, little-endian).
+// Named so build_*_inode helpers can write fields without requiring readers to
+// memorise the ext4 spec layout. Source: docs/ext4-spec/inodes-extents.md.
+pub(crate) const OFF_MODE: usize = 0x00;
+pub(crate) const OFF_SIZE_LO: usize = 0x04;
+pub(crate) const OFF_ATIME: usize = 0x08;
+pub(crate) const OFF_CTIME: usize = 0x0C;
+pub(crate) const OFF_MTIME: usize = 0x10;
+pub(crate) const OFF_LINKS_COUNT: usize = 0x1A;
+pub(crate) const OFF_BLOCKS_LO: usize = 0x1C;
+pub(crate) const OFF_FLAGS: usize = 0x20;
+pub(crate) const OFF_BLOCK: usize = 0x28; // i_block area start (60 bytes, 0x28..0x64)
+pub(crate) const OFF_GENERATION: usize = 0x64;
+pub(crate) const OFF_SIZE_HI: usize = 0x6C;
+pub(crate) const OFF_BLOCKS_HI: usize = 0x74;
+pub(crate) const OFF_CHECKSUM_LO: usize = 0x7C;
+pub(crate) const OFF_EXTRA_ISIZE: usize = 0x80;
+pub(crate) const OFF_CHECKSUM_HI: usize = 0x82;
+pub(crate) const OFF_CRTIME: usize = 0x90;
+
+/// Default i_extra_isize value written into new inodes: covers checksum_hi,
+/// nsec timestamps, and i_crtime (32 bytes beyond the 128-byte base).
+pub(crate) const EXTRA_ISIZE_DEFAULT: u16 = 32;
+/// Minimum inode buffer length for i_crtime (offset 0x90) to be present.
+pub(crate) const INODE_SIZE_WITH_CRTIME: usize = 0x94;
+/// Minimum inode buffer length for i_extra_isize + i_checksum_hi.
+pub(crate) const INODE_SIZE_WITH_EXTRA: usize = 0x84;
+
 // POSIX file-type bits (high nibble of i_mode).
 pub const S_IFMT: u16 = 0xF000;
 pub const S_IFREG: u16 = 0x8000;
@@ -103,31 +131,42 @@ impl Inode {
             return Err(Error::Corrupt("inode buffer too small"));
         }
 
-        let mode = u16::from_le_bytes(raw[0x00..0x02].try_into().unwrap());
+        let mode = u16::from_le_bytes(raw[OFF_MODE..OFF_MODE + 2].try_into().unwrap());
         let uid_lo = u16::from_le_bytes(raw[0x02..0x04].try_into().unwrap());
-        let size_lo = u32::from_le_bytes(raw[0x04..0x08].try_into().unwrap());
-        let atime = u32::from_le_bytes(raw[0x08..0x0C].try_into().unwrap());
-        let ctime = u32::from_le_bytes(raw[0x0C..0x10].try_into().unwrap());
-        let mtime = u32::from_le_bytes(raw[0x10..0x14].try_into().unwrap());
+        let size_lo = u32::from_le_bytes(raw[OFF_SIZE_LO..OFF_SIZE_LO + 4].try_into().unwrap());
+        let atime = u32::from_le_bytes(raw[OFF_ATIME..OFF_ATIME + 4].try_into().unwrap());
+        let ctime = u32::from_le_bytes(raw[OFF_CTIME..OFF_CTIME + 4].try_into().unwrap());
+        let mtime = u32::from_le_bytes(raw[OFF_MTIME..OFF_MTIME + 4].try_into().unwrap());
         let dtime = u32::from_le_bytes(raw[0x14..0x18].try_into().unwrap());
         let gid_lo = u16::from_le_bytes(raw[0x18..0x1A].try_into().unwrap());
-        let links_count = u16::from_le_bytes(raw[0x1A..0x1C].try_into().unwrap());
-        let blocks_lo = u32::from_le_bytes(raw[0x1C..0x20].try_into().unwrap());
-        let flags = u32::from_le_bytes(raw[0x20..0x24].try_into().unwrap());
+        let links_count = u16::from_le_bytes(
+            raw[OFF_LINKS_COUNT..OFF_LINKS_COUNT + 2]
+                .try_into()
+                .unwrap(),
+        );
+        let blocks_lo =
+            u32::from_le_bytes(raw[OFF_BLOCKS_LO..OFF_BLOCKS_LO + 4].try_into().unwrap());
+        let flags = u32::from_le_bytes(raw[OFF_FLAGS..OFF_FLAGS + 4].try_into().unwrap());
         // 0x24..0x28 is i_osd1 (Linux: i_version_lo) — ignored here.
 
         let mut block = [0u8; 60];
-        block.copy_from_slice(&raw[0x28..0x64]);
+        block.copy_from_slice(&raw[OFF_BLOCK..OFF_BLOCK + 60]);
 
-        let generation = u32::from_le_bytes(raw[0x64..0x68].try_into().unwrap());
+        let generation =
+            u32::from_le_bytes(raw[OFF_GENERATION..OFF_GENERATION + 4].try_into().unwrap());
         let file_acl_lo = u32::from_le_bytes(raw[0x68..0x6C].try_into().unwrap());
-        let size_hi = u32::from_le_bytes(raw[0x6C..0x70].try_into().unwrap());
+        let size_hi = u32::from_le_bytes(raw[OFF_SIZE_HI..OFF_SIZE_HI + 4].try_into().unwrap());
         // 0x70..0x74 obso_faddr ignored.
-        let blocks_hi = u16::from_le_bytes(raw[0x74..0x76].try_into().unwrap());
+        let blocks_hi =
+            u16::from_le_bytes(raw[OFF_BLOCKS_HI..OFF_BLOCKS_HI + 2].try_into().unwrap());
         let file_acl_hi = u16::from_le_bytes(raw[0x76..0x78].try_into().unwrap());
         let uid_hi = u16::from_le_bytes(raw[0x78..0x7A].try_into().unwrap());
         let gid_hi = u16::from_le_bytes(raw[0x7A..0x7C].try_into().unwrap());
-        let checksum_lo = u16::from_le_bytes(raw[0x7C..0x7E].try_into().unwrap());
+        let checksum_lo = u16::from_le_bytes(
+            raw[OFF_CHECKSUM_LO..OFF_CHECKSUM_LO + 2]
+                .try_into()
+                .unwrap(),
+        );
         // 0x7E..0x80 i_reserved2.
 
         // Defaults (when no extra section present).
@@ -142,7 +181,11 @@ impl Inode {
         // i_extra_isize covers them (>= 28 includes through i_projid; we read
         // what we need at >= 24 to cover up to crtime_extra).
         if raw.len() >= INODE_EXTRA_OFFSET + 4 {
-            let i_extra_isize = u16::from_le_bytes(raw[0x80..0x82].try_into().unwrap());
+            let i_extra_isize = u16::from_le_bytes(
+                raw[OFF_EXTRA_ISIZE..OFF_EXTRA_ISIZE + 2]
+                    .try_into()
+                    .unwrap(),
+            );
             // Sanity: i_extra_isize is the number of bytes beyond the 128-byte
             // base that are valid. Must fit inside the on-disk inode.
             let extra_end = INODE_EXTRA_OFFSET + i_extra_isize as usize;
@@ -160,7 +203,11 @@ impl Inode {
             //   0x90 u32 i_crtime               (needs >= 20)
             //   0x94 u32 i_crtime_extra         (needs >= 24)
             if i_extra_isize >= 4 {
-                checksum_hi = u16::from_le_bytes(raw[0x82..0x84].try_into().unwrap());
+                checksum_hi = u16::from_le_bytes(
+                    raw[OFF_CHECKSUM_HI..OFF_CHECKSUM_HI + 2]
+                        .try_into()
+                        .unwrap(),
+                );
             }
             if i_extra_isize >= 8 {
                 ctime_nsec = u32::from_le_bytes(raw[0x84..0x88].try_into().unwrap()) >> 2;
@@ -172,7 +219,7 @@ impl Inode {
                 atime_nsec = u32::from_le_bytes(raw[0x8C..0x90].try_into().unwrap()) >> 2;
             }
             if i_extra_isize >= 20 {
-                crtime = u32::from_le_bytes(raw[0x90..0x94].try_into().unwrap());
+                crtime = u32::from_le_bytes(raw[OFF_CRTIME..OFF_CRTIME + 4].try_into().unwrap());
             }
             if i_extra_isize >= 24 {
                 crtime_nsec = u32::from_le_bytes(raw[0x94..0x98].try_into().unwrap()) >> 2;
@@ -181,9 +228,9 @@ impl Inode {
 
         Ok(Self {
             mode,
-            uid: ((uid_hi as u32) << 16) | uid_lo as u32,
-            gid: ((gid_hi as u32) << 16) | gid_lo as u32,
-            size: ((size_hi as u64) << 32) | size_lo as u64,
+            uid: join16(uid_hi, uid_lo),
+            gid: join16(gid_hi, gid_lo),
+            size: join32(size_hi, size_lo),
             atime,
             mtime,
             ctime,
@@ -194,12 +241,12 @@ impl Inode {
             ctime_nsec,
             crtime_nsec,
             links_count,
-            blocks: ((blocks_hi as u64) << 32) | blocks_lo as u64,
+            blocks: join32(blocks_hi, blocks_lo),
             flags,
             block,
             generation,
-            file_acl: ((file_acl_hi as u64) << 32) | file_acl_lo as u64,
-            checksum: ((checksum_hi as u32) << 16) | checksum_lo as u32,
+            file_acl: join32(file_acl_hi, file_acl_lo),
+            checksum: join16(checksum_hi, checksum_lo),
         })
     }
 
@@ -234,5 +281,78 @@ impl Inode {
     /// Decode i_flags into a typed bitflags value (silently drops unknown bits).
     pub fn flag_set(&self) -> InodeFlags {
         InodeFlags::from_bits_truncate(self.flags)
+    }
+}
+
+/// Combine two 16-bit halves into a 32-bit value (hi occupies the upper 16 bits).
+/// Used when the on-disk layout stores a 32-bit field split across two u16 words.
+#[inline]
+fn join16(hi: u16, lo: u16) -> u32 {
+    ((hi as u32) << 16) | lo as u32
+}
+
+/// Combine a hi half (any type that fits in u64) and a 32-bit lo half into a
+/// 64-bit value. Used for size, file_acl, and i_blocks whose hi halves have
+/// different widths (u16 or u32) in the on-disk layout.
+#[inline]
+fn join32<H: Into<u64>>(hi: H, lo: u32) -> u64 {
+    (hi.into() << 32) | lo as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join16_combines_halves() {
+        assert_eq!(join16(0x0001, 0x0002), 0x0001_0002);
+        assert_eq!(join16(0xFFFF, 0x0000), 0xFFFF_0000);
+        assert_eq!(join16(0x0000, 0xFFFF), 0x0000_FFFF);
+        assert_eq!(join16(0, 0), 0);
+    }
+
+    #[test]
+    fn join32_combines_halves_u16_hi() {
+        assert_eq!(join32(0x0001u16, 0x0000_0002), 0x0000_0001_0000_0002);
+        assert_eq!(join32(0xFFFFu16, 0x0000_0000), 0x0000_FFFF_0000_0000);
+        assert_eq!(join32(0x0000u16, 0xFFFF_FFFF), 0x0000_0000_FFFF_FFFF);
+    }
+
+    #[test]
+    fn join32_combines_halves_u32_hi() {
+        assert_eq!(join32(0x0000_0001u32, 0x0000_0002), 0x0000_0001_0000_0002);
+        assert_eq!(join32(0xFFFF_FFFFu32, 0x0000_0000), 0xFFFF_FFFF_0000_0000);
+    }
+
+    #[test]
+    fn parse_rejects_short_buffer() {
+        let short = vec![0u8; 64];
+        assert!(matches!(
+            Inode::parse(&short),
+            Err(crate::error::Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_extra_isize() {
+        // 160-byte inode with i_extra_isize claiming 200 bytes (exceeds buffer).
+        let mut raw = vec![0u8; 160];
+        raw[0x80] = 200; // i_extra_isize lo byte — claims 200 bytes extra
+        raw[0x81] = 0;
+        assert!(matches!(
+            Inode::parse(&raw),
+            Err(crate::error::Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn parse_mode_and_links_roundtrip() {
+        let mut raw = vec![0u8; 128];
+        raw[0x00..0x02].copy_from_slice(&0x81A4u16.to_le_bytes()); // S_IFREG | 0644
+        raw[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes()); // links_count
+        let inode = Inode::parse(&raw).unwrap();
+        assert_eq!(inode.mode, 0x81A4);
+        assert_eq!(inode.links_count, 3);
+        assert!(inode.is_file());
     }
 }
