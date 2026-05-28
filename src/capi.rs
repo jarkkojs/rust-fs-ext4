@@ -145,7 +145,7 @@ pub extern "C" fn fs_ext4_last_errno() -> c_int {
 
 /// File type (matches `fs_ext4_file_type_t` in the header).
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum fs_ext4_file_type_t {
     Unknown = 0,
     RegFile = 1,
