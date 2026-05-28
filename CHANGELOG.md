@@ -1,5 +1,36 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- **Directory extent trees beyond depth 1** — `extend_dir_and_add_entry` now
+  handles directories whose extent trees have reached depth ≥ 2 (previously
+  returned a hard error). Uses the same `plan_insert_extent_deep` machinery
+  as file writes; allocates index-node blocks on demand via
+  `plan_block_allocation`.
+
+- **Depth-1 directory leaf-full fallback** — When the single leaf block in a
+  depth-1 directory extent tree fills up, the driver now falls back to the
+  deep path (adds a sibling leaf or promotes to depth 2) instead of returning
+  an error.
+
+- **Full Unicode NFD + case fold for CASEFOLD directories** — `fold_name` now
+  applies proper Unicode NFD decomposition (`unicode-normalization` crate)
+  followed by Unicode full case fold (`caseless` crate). Previously only
+  ASCII A–Z → a–z was folded, causing lookups for non-ASCII names (e.g. 'ñ'
+  vs 'Ñ', 'ß' vs 'ss') in CASEFOLD-enabled directories to miss the htree
+  entry and silently fail to find the file.
+
+- **`fs_ext4_attr_t` extended** — Seven new fields appended at the end of the
+  struct (ABI-compatible for consumers that zero-initialise):
+  - `atime_nsec`, `mtime_nsec`, `ctime_nsec`, `crtime_nsec` — sub-second
+    nanoseconds from the extra timestamp words; zero on ext2/ext3 inodes.
+  - `inode_flags` — on-disk e2_flags (FS_IOC_GETFLAGS convention); callers
+    can detect IMMUTABLE, NODUMP, APPEND_ONLY, CASEFOLD, etc.
+  - `generation` — `i_generation` for NFS stale-handle detection.
+  - `blocks_512` — `i_blocks` in 512-byte units (matches `st_blocks`).
+
 ## [0.2.1] — 2026-05-20
 
 ### Fixes
