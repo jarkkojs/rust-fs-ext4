@@ -171,6 +171,17 @@ pub struct fs_ext4_attr_t {
     pub crtime: u32,
     pub link_count: u16,
     pub file_type: fs_ext4_file_type_t,
+    /// Sub-second nanoseconds for atime/mtime/ctime/crtime (0 for old inodes).
+    pub atime_nsec: u32,
+    pub mtime_nsec: u32,
+    pub ctime_nsec: u32,
+    pub crtime_nsec: u32,
+    /// On-disk `i_flags` (e2_flags / FS_IOC_GETFLAGS convention).
+    pub inode_flags: u32,
+    /// `i_generation` — NFS stale-handle counter.
+    pub generation: u32,
+    /// `i_blocks` in 512-byte units (matches `st_blocks` from POSIX stat).
+    pub blocks_512: u64,
 }
 
 /// Directory entry (matches `fs_ext4_dirent_t`).
@@ -390,6 +401,13 @@ fn fill_attr(out: &mut fs_ext4_attr_t, ino: u32, inode: &Inode) {
     out.crtime = inode.crtime;
     out.link_count = inode.links_count;
     out.file_type = mode_to_file_type(inode.mode);
+    out.atime_nsec = inode.atime_nsec;
+    out.mtime_nsec = inode.mtime_nsec;
+    out.ctime_nsec = inode.ctime_nsec;
+    out.crtime_nsec = inode.crtime_nsec;
+    out.inode_flags = inode.flags;
+    out.generation = inode.generation;
+    out.blocks_512 = inode.blocks;
 }
 
 // ===========================================================================
