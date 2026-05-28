@@ -534,6 +534,15 @@ int fs_ext4_chmod(fs_ext4_fs_t *fs, const char *path, uint16_t mode);
 int fs_ext4_chown(fs_ext4_fs_t *fs, const char *path,
                   uint32_t uid, uint32_t gid);
 
+/* Set the i_flags word (FS_IOC_SETFLAGS) on `path`. `flags` is the
+ * full new flags value; common flags:
+ *   0x00000010  EXT4_IMMUTABLE_FL
+ *   0x00000020  EXT4_APPEND_FL
+ *   0x00000040  EXT4_NODUMP_FL
+ *   0x00000200  EXT4_NOATIME_FL
+ * Bumps i_ctime. Returns 0 on success, -1 on failure. */
+int fs_ext4_set_flags(fs_ext4_fs_t *fs, const char *path, uint32_t flags);
+
 /* Create a symbolic link at `linkpath` whose target is `target`.
  * POSIX symlink(target, linkpath) semantics. v1: fast-symlink only
  * (target ≤ 60 bytes); longer targets return 0 with EINVAL. Returns

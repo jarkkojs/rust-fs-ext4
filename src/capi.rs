@@ -2094,6 +2094,42 @@ pub unsafe extern "C" fn fs_ext4_chown(
     )
 }
 
+/// Set the `i_flags` word (FS_IOC_SETFLAGS) on `path`.
+///
+/// `flags` is the full new flags value. Common flags:
+///   0x00000010  EXT4_IMMUTABLE_FL (cannot modify / rename / delete)
+///   0x00000020  EXT4_APPEND_FL    (append-only)
+///   0x00000040  EXT4_NODUMP_FL    (excluded from `dump`)
+///   0x00000200  EXT4_NOATIME_FL   (no atime updates on read)
+///
+/// Bumps i_ctime. Returns 0 on success, -1 on failure.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_set_flags(
+    fs: *mut fs_ext4_fs_t,
+    path: *const c_char,
+    flags: u32,
+) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return -1;
+            }
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            match fs_ref.apply_set_flags(path_str, flags) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("set_flags {path_str}"));
+                    -1
+                }
+            }
+        }),
+    )
+}
+
 /// Set the access + modification times on `path`. Each `*_sec` is the
 /// POSIX seconds-since-epoch; pass `u32::MAX` (0xFFFF_FFFF) to leave a
 /// given pair unchanged. `*_nsec` are the sub-second nanoseconds (written

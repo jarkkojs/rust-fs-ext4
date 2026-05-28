@@ -1401,6 +1401,32 @@ impl Filesystem {
         self.commit_inode_write(ino, &raw)
     }
 
+    /// Set the `i_flags` field (FS_IOC_SETFLAGS) for the inode at `path`.
+    ///
+    /// The caller supplies the full new flags word; the driver writes it
+    /// verbatim into the inode's `i_flags` field at offset 0x20. Structural
+    /// flags that the library manages internally (EXTENTS_FL, INLINE_DATA_FL,
+    /// EA_INODE_FL) may be present in `flags` — they are written as-is; the
+    /// caller is responsible for not corrupting the inode structure.
+    ///
+    /// Bumps ctime. Fails with `Error::ReadOnly` on read-only mounts.
+    pub fn apply_set_flags(&self, path: &str, flags: u32) -> Result<()> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+
+        raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+
+        let now = now_unix_seconds();
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+
+        self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+        self.commit_inode_write(ino, &raw)
+    }
+
     /// Remove the extended attribute named `name` from the inode at `path`.
     /// `name` must carry a known namespace prefix (e.g. `"user.color"`).
     ///
