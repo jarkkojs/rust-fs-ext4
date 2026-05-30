@@ -61,7 +61,7 @@ fn patch_counter_u32(buf: &mut [u8], lo_off: usize, hi_off: Option<usize>, delta
         .map(|h| u16::from_le_bytes(buf[h..h + 2].try_into().unwrap()) as u32)
         .unwrap_or(0);
     let cur = (cur_hi << 16) | cur_lo;
-    let new = (cur as i64 + delta as i64).max(0) as u32;
+    let new = (cur as i64 + delta as i64).clamp(0, u32::MAX as i64) as u32;
     buf[lo_off..lo_off + 2].copy_from_slice(&((new & 0xFFFF) as u16).to_le_bytes());
     if let Some(h) = hi_off {
         buf[h..h + 2].copy_from_slice(&(((new >> 16) & 0xFFFF) as u16).to_le_bytes());
@@ -1482,14 +1482,13 @@ impl Filesystem {
 
     /// Set the `i_flags` field (FS_IOC_SETFLAGS) for the inode at `path`.
     ///
-    /// The caller supplies the full new flags word; the driver writes it
-    /// verbatim into the inode's `i_flags` field at offset 0x20. Structural
-    /// flags that the library manages internally (EXTENTS_FL, INLINE_DATA_FL,
-    /// EA_INODE_FL) may be present in `flags` — they are written as-is; the
-    /// caller is responsible for not corrupting the inode structure.
-    ///
-    /// Bumps ctime. Fails with `Error::ReadOnly` on read-only mounts.
+    /// Bumps ctime. Fails with `Error::ReadOnly` on read-only mounts, or
+    /// `Error::InvalidArgument` if the caller attempts to flip any of the
+    /// layout-critical flags managed internally (EXTENTS_FL, INLINE_DATA_FL,
+    /// EA_INODE_FL) — changing those without rewriting the inode payload would
+    /// corrupt the filesystem.
     pub fn apply_set_flags(&self, path: &str, flags: u32) -> Result<()> {
+        use crate::inode::{InodeFlags, OFF_CTIME, OFF_FLAGS};
         if !self.dev.is_writable() {
             return Err(Error::ReadOnly);
         }
@@ -1497,10 +1496,19 @@ impl Filesystem {
         let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
 
-        raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+        let managed = InodeFlags::EXTENTS.bits()
+            | InodeFlags::INLINE_DATA.bits()
+            | InodeFlags::EA_INODE.bits();
+        if (flags ^ inode.flags) & managed != 0 {
+            return Err(Error::InvalidArgument(
+                "set_flags: cannot modify internally-managed inode flags (EXTENTS, INLINE_DATA, EA_INODE)",
+            ));
+        }
+
+        raw[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
 
         let now = now_unix_seconds();
-        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+        raw[OFF_CTIME..OFF_CTIME + 4].copy_from_slice(&now.to_le_bytes());
 
         self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
         self.commit_inode_write(ino, &raw)
@@ -3406,8 +3414,7 @@ impl Filesystem {
         let extent_entry_off = extent_header_off + 12;
         raw[extent_entry_off..extent_entry_off + 4].copy_from_slice(&0u32.to_le_bytes());
         raw[extent_entry_off + 4..extent_entry_off + 6].copy_from_slice(&1u16.to_le_bytes());
-        let extent_phys_hi = ((data_phys_block >> 32) & 0xFFFF) as u16;
-        let extent_phys_lo = (data_phys_block & 0xFFFF_FFFF) as u32;
+        let (extent_phys_hi, extent_phys_lo) = crate::extent_mut::split_phys_block(data_phys_block);
         raw[extent_entry_off + 6..extent_entry_off + 8]
             .copy_from_slice(&extent_phys_hi.to_le_bytes());
         raw[extent_entry_off + 8..extent_entry_off + 12]
@@ -4371,19 +4378,18 @@ impl Filesystem {
         let bs_u64 = bs as u64;
         let parent_group = (parent_ino - 1) / self.sb.inodes_per_group;
 
-        // Commit the pre-allocated data block first so the alloc closure
-        // picks different blocks for tree-meta nodes.
-        self.mark_block_run_used(data_plan.first_block, 1)?;
-        self.patch_bgd_counters(
-            data_plan.bgd.group_idx as usize,
-            data_plan.bgd.free_blocks_delta,
-            data_plan.bgd.free_inodes_delta,
-            data_plan.bgd.used_dirs_delta,
-        )?;
-        self.patch_sb_counters(
-            data_plan.sb.free_blocks_delta,
-            data_plan.sb.free_inodes_delta,
-        )?;
+        // Collect all allocation plans without committing them yet.  Committing
+        // eagerly (old behaviour) leaked blocks permanently when
+        // plan_insert_extent_deep or the subsequent writes failed — the bitmap
+        // was marked used but no extent ever referenced those blocks.  Instead,
+        // we gather all plans and commit them only after every write succeeds,
+        // matching the late-commit ordering of extend_dir_and_add_entry_depth1.
+        //
+        // To prevent alloc_fn from picking data_plan.first_block for a meta
+        // node (which plan_block_allocation could do since the bitmap is
+        // unchanged), the closure skips that block and retries once.
+        let data_block = data_plan.first_block;
+        let mut pending_meta: Vec<crate::alloc::BlockAllocationPlan> = Vec::new();
 
         let reader = FsBlockReader { fs: self };
         let mut meta_block_count: u64 = 0;
@@ -4400,20 +4406,15 @@ impl Filesystem {
                 parent_group,
                 &mut bm_reader,
             )?;
-            let meta_phys = meta_plan.first_block;
-            self.mark_block_run_used(meta_phys, 1)?;
-            self.patch_bgd_counters(
-                meta_plan.bgd.group_idx as usize,
-                meta_plan.bgd.free_blocks_delta,
-                meta_plan.bgd.free_inodes_delta,
-                meta_plan.bgd.used_dirs_delta,
-            )?;
-            self.patch_sb_counters(
-                meta_plan.sb.free_blocks_delta,
-                meta_plan.sb.free_inodes_delta,
-            )?;
+            if meta_plan.first_block == data_block {
+                // The allocator returned the same block we reserved for the
+                // data page.  There are no other free blocks in this group,
+                // so the tree cannot grow further.
+                return Err(Error::NoSpaceLeftOnDevice);
+            }
             meta_block_count += 1;
-            Ok(meta_phys)
+            pending_meta.push(meta_plan);
+            Ok(pending_meta.last().unwrap().first_block)
         };
 
         let deep_plan = crate::extent_mut::plan_insert_extent_deep(
@@ -4477,6 +4478,29 @@ impl Filesystem {
             block[end - 4..end].copy_from_slice(&c.to_le_bytes());
         }
         self.dev.write_at(new_phys * bs_u64, &block)?;
+
+        // All writes succeeded — now commit the allocation accounting.
+        self.mark_block_run_used(data_plan.first_block, 1)?;
+        self.patch_bgd_counters(
+            data_plan.bgd.group_idx as usize,
+            data_plan.bgd.free_blocks_delta,
+            data_plan.bgd.free_inodes_delta,
+            data_plan.bgd.used_dirs_delta,
+        )?;
+        self.patch_sb_counters(
+            data_plan.sb.free_blocks_delta,
+            data_plan.sb.free_inodes_delta,
+        )?;
+        for plan in pending_meta {
+            self.mark_block_run_used(plan.first_block, 1)?;
+            self.patch_bgd_counters(
+                plan.bgd.group_idx as usize,
+                plan.bgd.free_blocks_delta,
+                plan.bgd.free_inodes_delta,
+                plan.bgd.used_dirs_delta,
+            )?;
+            self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+        }
 
         Ok(())
     }
