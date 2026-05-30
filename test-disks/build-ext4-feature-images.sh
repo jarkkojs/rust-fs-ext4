@@ -273,7 +273,7 @@ if [[ "$SERVER_MODE" == "1" ]]; then
         -drive file="$CACHE/ovl.iso",media=cdrom,readonly=on,if=ide,index=1 \
         -virtfs local,path="$SERVER_IMAGE_DIR",mount_tag=host,security_model=mapped-xattr,id=host \
         -virtfs local,path="$CACHE",mount_tag=cache,security_model=mapped-xattr,id=cache \
-        -netdev "user,id=net0,hostfwd=tcp::${EXT4_BUILDER_PORT}-:22" \
+        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${EXT4_BUILDER_PORT}-:22" \
         -device virtio-net-pci,netdev=net0 \
         -m 1024 \
         -smp 2 \
