@@ -145,7 +145,7 @@ pub extern "C" fn fs_ext4_last_errno() -> c_int {
 
 /// File type (matches `fs_ext4_file_type_t` in the header).
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum fs_ext4_file_type_t {
     Unknown = 0,
     RegFile = 1,
@@ -171,6 +171,17 @@ pub struct fs_ext4_attr_t {
     pub crtime: u32,
     pub link_count: u16,
     pub file_type: fs_ext4_file_type_t,
+    /// Sub-second nanoseconds for atime/mtime/ctime/crtime (0 for old inodes).
+    pub atime_nsec: u32,
+    pub mtime_nsec: u32,
+    pub ctime_nsec: u32,
+    pub crtime_nsec: u32,
+    /// On-disk `i_flags` (e2_flags / FS_IOC_GETFLAGS convention).
+    pub inode_flags: u32,
+    /// `i_generation` — NFS stale-handle counter.
+    pub generation: u32,
+    /// `i_blocks` in 512-byte units (matches `st_blocks` from POSIX stat).
+    pub blocks_512: u64,
 }
 
 /// Directory entry (matches `fs_ext4_dirent_t`).
@@ -390,6 +401,13 @@ fn fill_attr(out: &mut fs_ext4_attr_t, ino: u32, inode: &Inode) {
     out.crtime = inode.crtime;
     out.link_count = inode.links_count;
     out.file_type = mode_to_file_type(inode.mode);
+    out.atime_nsec = inode.atime_nsec;
+    out.mtime_nsec = inode.mtime_nsec;
+    out.ctime_nsec = inode.ctime_nsec;
+    out.crtime_nsec = inode.crtime_nsec;
+    out.inode_flags = inode.flags;
+    out.generation = inode.generation;
+    out.blocks_512 = inode.blocks;
 }
 
 // ===========================================================================
@@ -2069,6 +2087,79 @@ pub unsafe extern "C" fn fs_ext4_chown(
                 Ok(()) => 0,
                 Err(e) => {
                     set_err_from(&e, &format!("chown {path_str}"));
+                    -1
+                }
+            }
+        }),
+    )
+}
+
+/// Create a special file: FIFO, socket, or character/block device.
+///
+/// `mode` must include the file-type bits plus permission bits, e.g.:
+///   `0x1000 | 0644` for a FIFO (S_IFIFO), `0xC000 | 0666` for a socket,
+///   `0x2000 | 0660` for a char device, `0x6000 | 0660` for a block device.
+///
+/// `major` / `minor` are device numbers for char/block devices; pass 0 for
+/// FIFOs and sockets. Returns the new inode number on success, 0 on failure.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_mknod(
+    fs: *mut fs_ext4_fs_t,
+    path: *const c_char,
+    mode: u16,
+    major: u32,
+    minor: u32,
+) -> u32 {
+    ffi_guard(
+        0u32,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return 0u32;
+            }
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            match fs_ref.apply_mknod(path_str, mode, major, minor) {
+                Ok(ino) => ino,
+                Err(e) => {
+                    set_err_from(&e, &format!("mknod {path_str}"));
+                    0u32
+                }
+            }
+        }),
+    )
+}
+
+/// Set the `i_flags` word (FS_IOC_SETFLAGS) on `path`.
+///
+/// `flags` is the full new flags value. Common flags:
+///   0x00000010  EXT4_IMMUTABLE_FL (cannot modify / rename / delete)
+///   0x00000020  EXT4_APPEND_FL    (append-only)
+///   0x00000040  EXT4_NODUMP_FL    (excluded from `dump`)
+///   0x00000200  EXT4_NOATIME_FL   (no atime updates on read)
+///
+/// Bumps i_ctime. Returns 0 on success, -1 on failure.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_set_flags(
+    fs: *mut fs_ext4_fs_t,
+    path: *const c_char,
+    flags: u32,
+) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return -1;
+            }
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            match fs_ref.apply_set_flags(path_str, flags) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("set_flags {path_str}"));
                     -1
                 }
             }

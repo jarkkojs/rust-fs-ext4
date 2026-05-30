@@ -35,7 +35,20 @@ typedef enum {
     FS_EXT4_FT_SYMLINK  = 7,
 } fs_ext4_file_type_t;
 
-/* File/directory attributes */
+/* File/directory attributes.
+ *
+ * nsec fields are sub-second nanoseconds (0..999_999_999).  They are zero
+ * when the on-disk inode's i_extra_isize is too small to hold the extra
+ * timestamp words (ext2/ext3 inodes, or very old ext4 images).
+ *
+ * inode_flags mirrors the on-disk e2 flags word (FS_IOC_GETFLAGS convention):
+ *   0x00000010  EXT4_IMMUTABLE_FL
+ *   0x00000020  EXT4_APPEND_FL
+ *   0x00000040  EXT4_NODUMP_FL
+ *   0x00010000  EXT4_ENCRYPT_FL
+ *   0x00020000  EXT4_CASEFOLD_FL
+ *   …(full list in <linux/fs.h>)
+ */
 typedef struct {
     uint32_t inode;
     uint16_t mode;          /* POSIX mode bits */
@@ -48,6 +61,17 @@ typedef struct {
     uint32_t crtime;        /* Creation time (ext4 extra) */
     uint16_t link_count;
     fs_ext4_file_type_t file_type;
+    /* Sub-second timestamp precision (added in v0.3) */
+    uint32_t atime_nsec;
+    uint32_t mtime_nsec;
+    uint32_t ctime_nsec;
+    uint32_t crtime_nsec;
+    /* Inode flags (e2_flags / FS_IOC_GETFLAGS, added in v0.3) */
+    uint32_t inode_flags;
+    /* i_generation — monotone counter for NFS stale-handle detection */
+    uint32_t generation;
+    /* i_blocks in 512-byte units — matches st_blocks from stat(2) */
+    uint64_t blocks_512;
 } fs_ext4_attr_t;
 
 /* Directory entry (returned during iteration) */
@@ -509,6 +533,24 @@ int fs_ext4_chmod(fs_ext4_fs_t *fs, const char *path, uint16_t mode);
  * success, -1 on failure. */
 int fs_ext4_chown(fs_ext4_fs_t *fs, const char *path,
                   uint32_t uid, uint32_t gid);
+
+/* Create a special file (FIFO, socket, char device, block device).
+ * `mode` must include the file-type bits (S_IFIFO=0x1000, S_IFSOCK=0xC000,
+ * S_IFCHR=0x2000, S_IFBLK=0x6000) plus permission bits.
+ * `major`/`minor` are device numbers for char/block devices; pass 0
+ * for FIFOs and sockets. Returns the new inode number on success, 0 on
+ * failure. */
+uint32_t fs_ext4_mknod(fs_ext4_fs_t *fs, const char *path,
+                       uint16_t mode, uint32_t major, uint32_t minor);
+
+/* Set the i_flags word (FS_IOC_SETFLAGS) on `path`. `flags` is the
+ * full new flags value; common flags:
+ *   0x00000010  EXT4_IMMUTABLE_FL
+ *   0x00000020  EXT4_APPEND_FL
+ *   0x00000040  EXT4_NODUMP_FL
+ *   0x00000200  EXT4_NOATIME_FL
+ * Bumps i_ctime. Returns 0 on success, -1 on failure. */
+int fs_ext4_set_flags(fs_ext4_fs_t *fs, const char *path, uint32_t flags);
 
 /* Create a symbolic link at `linkpath` whose target is `target`.
  * POSIX symlink(target, linkpath) semantics. v1: fast-symlink only

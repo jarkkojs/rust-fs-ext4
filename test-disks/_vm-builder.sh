@@ -11,7 +11,26 @@
 # capi_* test suite depend on the exact content written here.
 
 set -eu
-cd /host
+
+# Optional first argument: output directory (defaults to /host so the
+# existing one-shot batch mode is unchanged). Subsequent arguments are
+# the image types to build (same as before). Accepting an output dir
+# lets the persistent-VM caller write images into per-run subdirectories:
+#   sh /host/_vm-builder.sh /host/{run_id} basic
+# Distinguish a directory path from a target name: if $1 looks like a
+# known target (or is empty), treat it as a target and leave OUTPUT_DIR
+# as the default; otherwise treat it as the output directory and shift.
+case "${1:-}" in
+    ""|basic|htree|csum_seed|no_csum|deep_extents|inline|xattr|acl|largedir|manyfiles|whole_disk)
+        OUTPUT_DIR=/host
+        ;;
+    *)
+        OUTPUT_DIR=$1
+        shift
+        ;;
+esac
+mkdir -p "$OUTPUT_DIR"
+cd "$OUTPUT_DIR"
 
 mkdir -p /mnt/img
 
@@ -41,7 +60,10 @@ build_htree() {
     echo "[vm] $img"
     rm -f $img
     truncate -s 16M $img
+    # Fixed hash_seed makes the htree directory entry order deterministic
+    # across builds (mkfs.ext4 randomises it by default).
     mkfs.ext4 -q -F -b 4096 -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum \
+        -E hash_seed=a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
         -L htree-vol $img
     mount -t ext4 -o loop $img /mnt/img
     mkdir -p /mnt/img/bigdir
@@ -190,9 +212,39 @@ build_manyfiles() {
     umount /mnt/img
 }
 
+build_whole_disk() {
+    local img=ext4-whole-disk.img
+    local offset sizelimit loop=""
+    echo "[vm] $img"
+    rm -f $img
+    # 20 MiB: 1 MiB GPT header area + 16 MiB partition (32768 × 512 B) + 1 MiB GPT backup
+    truncate -s 20M $img
+    # GPT with one Linux-fs partition at LBA 2048, 32768 sectors.
+    # sfdisk (util-linux) is required — busybox sfdisk lacks GPT support.
+    printf 'label: gpt\nstart=2048, size=32768, type=L\n' | sfdisk $img >/dev/null
+    # Use --offset/--sizelimit to map the partition area directly, avoiding
+    # the need for kernel partition device support (-P / /dev/loopNpM).
+    trap 'umount /mnt/img 2>/dev/null || true; [ -n "$loop" ] && losetup -d "$loop" 2>/dev/null || true' EXIT HUP INT TERM
+    offset=$((2048 * 512))
+    sizelimit=$((32768 * 512))
+    loop=$(losetup -f --show --offset "$offset" --sizelimit "$sizelimit" "$img")
+    mkfs.ext4 -q -F -b 4096 \
+        -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum \
+        -L wholedisk "$loop"
+    mount -t ext4 "$loop" /mnt/img
+    echo 'whole disk test' > /mnt/img/test.txt
+    mkdir -p /mnt/img/subdir
+    echo 'nested' > /mnt/img/subdir/nested.txt
+    ln -s test.txt /mnt/img/link.txt
+    sync
+    umount /mnt/img
+    losetup -d "$loop"
+    trap - EXIT HUP INT TERM
+}
+
 # --- dispatch -------------------------------------------------------------
 
-ALL="basic htree csum_seed no_csum deep_extents inline xattr acl largedir manyfiles"
+ALL="basic htree csum_seed no_csum deep_extents inline xattr acl largedir manyfiles whole_disk"
 TARGETS="${*:-$ALL}"
 
 for t in $TARGETS; do
@@ -207,6 +259,7 @@ for t in $TARGETS; do
         acl)          build_acl ;;
         largedir)     build_largedir ;;
         manyfiles)    build_manyfiles ;;
+        whole_disk)   build_whole_disk ;;
         *)            echo "[vm] unknown target: $t (have: $ALL)" >&2; exit 1 ;;
     esac
 done

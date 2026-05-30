@@ -50,6 +50,34 @@ impl BlockBuffer {
     }
 }
 
+/// Patch a split u32 counter (lo: u16 + optional hi: u16) in `buf` by `delta`.
+///
+/// ext4 BGD counters are stored as a 16-bit low word at `lo_off` and an
+/// optional 16-bit high word at `hi_off` (present when desc_size >= 64). The
+/// combined 32-bit value is clamped to zero on underflow.
+fn patch_counter_u32(buf: &mut [u8], lo_off: usize, hi_off: Option<usize>, delta: i32) {
+    let cur_lo = u16::from_le_bytes(buf[lo_off..lo_off + 2].try_into().unwrap()) as u32;
+    let cur_hi = hi_off
+        .map(|h| u16::from_le_bytes(buf[h..h + 2].try_into().unwrap()) as u32)
+        .unwrap_or(0);
+    let cur = (cur_hi << 16) | cur_lo;
+    let new = (cur as i64 + delta as i64).clamp(0, u32::MAX as i64) as u32;
+    buf[lo_off..lo_off + 2].copy_from_slice(&((new & 0xFFFF) as u16).to_le_bytes());
+    if let Some(h) = hi_off {
+        buf[h..h + 2].copy_from_slice(&(((new >> 16) & 0xFFFF) as u16).to_le_bytes());
+    }
+}
+
+/// Pack the low bits of an ext4 nanosecond timestamp field.
+///
+/// ext4 stores extra precision in a 32-bit extra field: bits [31:2] hold the
+/// low 30 bits of the nanosecond value; bits [1:0] are the 2-bit epoch
+/// extension that extends the 32-bit seconds counter beyond 2038.
+#[inline]
+fn pack_nsec_lo(nsec: u32) -> u32 {
+    (nsec & 0x3FFF_FFFF) << 2
+}
+
 /// Split a `/a/b/c` path into (`/a/b`, `c`). Returns an error for empty or
 /// `"/"` paths (no basename to act on).
 fn split_parent_and_base(path: &str) -> Result<(String, String)> {
@@ -109,6 +137,54 @@ fn now_unix_seconds() -> u32 {
         .unwrap_or(0)
 }
 
+// -----------------------------------------------------------------------
+// Inode builder helpers (H2)
+// -----------------------------------------------------------------------
+// Shared across all build_*_inode functions. Extracted to avoid five
+// identical copies of timestamps, generation, extra_isize, and checksum.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+/// Process-lifetime counter shared by all inode builders so successive
+/// creates within the same session produce distinct i_generation values.
+static INODE_GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+/// Write atime, ctime, mtime (and crtime when the inode buffer is large
+/// enough) from `now` into the raw inode bytes.
+fn write_inode_timestamps(raw: &mut [u8], now: u32) {
+    use crate::inode::{INODE_SIZE_WITH_CRTIME, OFF_ATIME, OFF_CRTIME, OFF_CTIME, OFF_MTIME};
+    raw[OFF_ATIME..OFF_ATIME + 4].copy_from_slice(&now.to_le_bytes());
+    raw[OFF_CTIME..OFF_CTIME + 4].copy_from_slice(&now.to_le_bytes());
+    raw[OFF_MTIME..OFF_MTIME + 4].copy_from_slice(&now.to_le_bytes());
+    // i_crtime (birth time) only exists in the extra section. Without it,
+    // Darwin's st_birthtime / Finder "Created" date shows 1970-01-01.
+    if raw.len() >= INODE_SIZE_WITH_CRTIME {
+        raw[OFF_CRTIME..OFF_CRTIME + 4].copy_from_slice(&now.to_le_bytes());
+    }
+}
+
+/// Allocate a unique i_generation value for a new inode: PID combined with
+/// a per-process counter. Ensures distinct values across rapid successive
+/// creates (NFS stale-handle detection depends on generation uniqueness).
+fn alloc_inode_generation() -> u32 {
+    std::process::id().wrapping_add(INODE_GEN_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Write a pre-allocated generation value into the raw inode bytes.
+fn write_inode_generation(raw: &mut [u8], generation: u32) {
+    use crate::inode::OFF_GENERATION;
+    raw[OFF_GENERATION..OFF_GENERATION + 4].copy_from_slice(&generation.to_le_bytes());
+}
+
+/// Write i_extra_isize = 32 when the inode buffer is large enough.
+/// 32 covers checksum_hi, nsec timestamps, and i_crtime beyond the 128-byte base.
+fn write_inode_extra_isize(raw: &mut [u8]) {
+    use crate::inode::{EXTRA_ISIZE_DEFAULT, INODE_SIZE_WITH_EXTRA, OFF_EXTRA_ISIZE};
+    if raw.len() >= INODE_SIZE_WITH_EXTRA {
+        raw[OFF_EXTRA_ISIZE..OFF_EXTRA_ISIZE + 2]
+            .copy_from_slice(&EXTRA_ISIZE_DEFAULT.to_le_bytes());
+    }
+}
+
 pub struct Filesystem {
     pub dev: Arc<dyn BlockDevice>,
     pub sb: Superblock,
@@ -124,6 +200,23 @@ pub struct Filesystem {
     /// style images. Locked per-op so mutating capi calls serialize on
     /// the JBD2 sequence cursor.
     pub journal: Option<std::sync::Mutex<crate::journal_writer::JournalWriter>>,
+}
+
+/// Encapsulates the common setup for creating a new inode in a directory:
+/// resolved parent, pre-allocated inode number, and a `BlockBuffer` with the
+/// inode-bitmap + BGD + SB counter updates already staged. Produced by
+/// `Filesystem::plan_new_inode_in_dir`.
+struct NewInodePlan {
+    /// Newly allocated inode number (1-based).
+    new_ino: u32,
+    /// Inode number of the parent directory.
+    parent_ino: u32,
+    /// Parsed parent inode (for reading the directory block).
+    parent_inode: crate::inode::Inode,
+    /// Staged write buffer (bitmap + counter deltas already applied).
+    buf: BlockBuffer,
+    /// Final component of `path` — the name to add as a dir entry.
+    base_name: String,
 }
 
 impl Filesystem {
@@ -839,8 +932,7 @@ impl Filesystem {
                 e.length
             };
             root[off + 4..off + 6].copy_from_slice(&ee_len.to_le_bytes());
-            let phys_hi = ((e.physical_block >> 32) & 0xFFFF) as u16;
-            let phys_lo = (e.physical_block & 0xFFFF_FFFF) as u32;
+            let (phys_hi, phys_lo) = crate::extent_mut::split_phys_block(e.physical_block);
             root[off + 6..off + 8].copy_from_slice(&phys_hi.to_le_bytes());
             root[off + 8..off + 12].copy_from_slice(&phys_lo.to_le_bytes());
         }
@@ -1076,20 +1168,7 @@ impl Filesystem {
         let off_in_block = (byte_in_bgt % bs) as usize;
 
         let block = buf.get_mut(self, bgt_block)?;
-        // Same patch logic as patch_bgd_counters.
-        let patch_u32 = |block: &mut [u8], lo: usize, hi: Option<usize>, delta: i32| {
-            let cur_lo = u16::from_le_bytes(block[lo..lo + 2].try_into().unwrap()) as u32;
-            let cur_hi = hi
-                .map(|h| u16::from_le_bytes(block[h..h + 2].try_into().unwrap()) as u32)
-                .unwrap_or(0);
-            let cur = (cur_hi << 16) | cur_lo;
-            let new = (cur as i64 + delta as i64).max(0) as u32;
-            block[lo..lo + 2].copy_from_slice(&((new & 0xFFFF) as u16).to_le_bytes());
-            if let Some(h) = hi {
-                block[h..h + 2].copy_from_slice(&(((new >> 16) & 0xFFFF) as u16).to_le_bytes());
-            }
-        };
-        patch_u32(
+        patch_counter_u32(
             block,
             off_in_block + 0x0C,
             if desc_size >= 0x40 {
@@ -1099,7 +1178,7 @@ impl Filesystem {
             },
             free_blocks_delta,
         );
-        patch_u32(
+        patch_counter_u32(
             block,
             off_in_block + 0x0E,
             if desc_size >= 0x40 {
@@ -1109,7 +1188,7 @@ impl Filesystem {
             },
             free_inodes_delta,
         );
-        patch_u32(
+        patch_counter_u32(
             block,
             off_in_block + 0x10,
             if desc_size >= 0x40 {
@@ -1401,6 +1480,40 @@ impl Filesystem {
         self.commit_inode_write(ino, &raw)
     }
 
+    /// Set the `i_flags` field (FS_IOC_SETFLAGS) for the inode at `path`.
+    ///
+    /// Bumps ctime. Fails with `Error::ReadOnly` on read-only mounts, or
+    /// `Error::InvalidArgument` if the caller attempts to flip any of the
+    /// layout-critical flags managed internally (EXTENTS_FL, INLINE_DATA_FL,
+    /// EA_INODE_FL) — changing those without rewriting the inode payload would
+    /// corrupt the filesystem.
+    pub fn apply_set_flags(&self, path: &str, flags: u32) -> Result<()> {
+        use crate::inode::{InodeFlags, OFF_CTIME, OFF_FLAGS};
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+
+        let managed = InodeFlags::EXTENTS.bits()
+            | InodeFlags::INLINE_DATA.bits()
+            | InodeFlags::EA_INODE.bits();
+        if (flags ^ inode.flags) & managed != 0 {
+            return Err(Error::InvalidArgument(
+                "set_flags: cannot modify internally-managed inode flags (EXTENTS, INLINE_DATA, EA_INODE)",
+            ));
+        }
+
+        raw[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+
+        let now = now_unix_seconds();
+        raw[OFF_CTIME..OFF_CTIME + 4].copy_from_slice(&now.to_le_bytes());
+
+        self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+        self.commit_inode_write(ino, &raw)
+    }
+
     /// Remove the extended attribute named `name` from the inode at `path`.
     /// `name` must carry a known namespace prefix (e.g. `"user.color"`).
     ///
@@ -1622,8 +1735,7 @@ impl Filesystem {
 
         // Splice block_nr into the inode: i_file_acl_lo at 0x68..0x6C, hi
         // at 0x74..0x76.
-        let acl_lo = (block_nr & 0xFFFF_FFFF) as u32;
-        let acl_hi = ((block_nr >> 32) & 0xFFFF) as u16;
+        let (acl_hi, acl_lo) = crate::extent_mut::split_phys_block(block_nr);
         raw[0x68..0x6C].copy_from_slice(&acl_lo.to_le_bytes());
         if raw.len() >= 0x76 {
             raw[0x74..0x76].copy_from_slice(&acl_hi.to_le_bytes());
@@ -1702,11 +1814,11 @@ impl Filesystem {
                 raw[0x84..0x88].copy_from_slice(&0u32.to_le_bytes());
             }
             if mtime_sec != u32::MAX && i_extra_isize >= 12 && raw.len() >= 0x8C {
-                let packed = (mtime_nsec & 0x3FFF_FFFF) << 2;
+                let packed = pack_nsec_lo(mtime_nsec);
                 raw[0x88..0x8C].copy_from_slice(&packed.to_le_bytes());
             }
             if atime_sec != u32::MAX && i_extra_isize >= 16 && raw.len() >= 0x90 {
-                let packed = (atime_nsec & 0x3FFF_FFFF) << 2;
+                let packed = pack_nsec_lo(atime_nsec);
                 raw[0x8C..0x90].copy_from_slice(&packed.to_le_bytes());
             }
         }
@@ -1863,6 +1975,66 @@ impl Filesystem {
         self.commit_block_buffer(buf)
     }
 
+    /// Common setup for creating a new inode inside a directory: resolves
+    /// the parent, checks preconditions, allocates an inode, and stages the
+    /// bitmap + counter updates into a fresh `BlockBuffer`. The caller then
+    /// builds the inode bytes and adds the dir entry.
+    fn plan_new_inode_in_dir(&self, path: &str) -> Result<NewInodePlan> {
+        let (parent_path, base_name) = split_parent_and_base(path)?;
+        if base_name.len() > 255 {
+            return Err(Error::NameTooLong);
+        }
+
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let parent_ino =
+            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
+        let (parent_inode, _) = self.read_inode_verified(parent_ino)?;
+        if !parent_inode.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        if self
+            .find_entry_in_dir(&parent_inode, base_name.as_bytes())
+            .is_ok()
+        {
+            return Err(Error::AlreadyExists);
+        }
+
+        let parent_group = (parent_ino - 1) / self.sb.inodes_per_group;
+        let bs = self.sb.block_size();
+        let mut bitmap_reader = |block: u64| self.read_block(block);
+        let plan = crate::alloc::plan_inode_allocation(
+            &self.sb,
+            &self.groups,
+            false,
+            parent_group,
+            &mut bitmap_reader,
+        )?;
+        let new_ino = plan.inode;
+
+        let mut buf = BlockBuffer::new(bs);
+        self.buffer_mark_inode_used(&mut buf, new_ino)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
+            plan.bgd.group_idx as usize,
+            plan.bgd.free_blocks_delta,
+            plan.bgd.free_inodes_delta,
+            plan.bgd.used_dirs_delta,
+        )?;
+        self.buffer_patch_sb_counters(
+            &mut buf,
+            plan.sb.free_blocks_delta,
+            plan.sb.free_inodes_delta,
+        )?;
+
+        Ok(NewInodePlan {
+            new_ino,
+            parent_ino,
+            parent_inode,
+            buf,
+            base_name,
+        })
+    }
+
     /// Create a new regular file at `path` with permission bits `mode`
     /// (e.g. `0o644`). Returns the allocated inode number on success.
     ///
@@ -1881,64 +2053,24 @@ impl Filesystem {
         if !self.dev.is_writable() {
             return Err(Error::ReadOnly);
         }
-        let (parent_path, base_name) = split_parent_and_base(path)?;
-        if base_name.len() > 255 {
-            return Err(Error::NameTooLong);
-        }
+        let NewInodePlan {
+            new_ino,
+            parent_ino,
+            parent_inode,
+            mut buf,
+            base_name,
+        } = self.plan_new_inode_in_dir(path)?;
 
-        // Resolve parent. Refuse if target already exists.
-        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let parent_ino_num =
-            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
-        let (parent_inode, _parent_raw) = self.read_inode_verified(parent_ino_num)?;
-        if !parent_inode.is_dir() {
-            return Err(Error::NotADirectory);
-        }
-        if self
-            .find_entry_in_dir(&parent_inode, base_name.as_bytes())
-            .is_ok()
-        {
-            return Err(Error::AlreadyExists);
-        }
-
-        // Allocate an inode, hinted to the parent's group.
-        let parent_group = (parent_ino_num - 1) / self.sb.inodes_per_group;
-        let bs = self.sb.block_size();
-        let mut bitmap_reader = |block: u64| self.read_block(block);
-        let plan = crate::alloc::plan_inode_allocation(
-            &self.sb,
-            &self.groups,
-            false,
-            parent_group,
-            &mut bitmap_reader,
-        )?;
-        let new_ino = plan.inode;
+        let raw = self.build_regular_file_inode(new_ino, mode)?;
+        self.buffer_write_inode(&mut buf, new_ino, &raw)?;
 
         // Multi-block transaction: inode bitmap + BGD + SB + new inode +
         // parent dir entry, all atomic. The fall-through to extend-dir
         // (when the parent has no room) must commit the buffer first
         // and then run extend un-journaled — see end of fn.
-        let mut buf = BlockBuffer::new(bs);
-        self.buffer_mark_inode_used(&mut buf, new_ino)?;
-        self.buffer_patch_bgd_counters(
-            &mut buf,
-            plan.bgd.group_idx as usize,
-            plan.bgd.free_blocks_delta,
-            plan.bgd.free_inodes_delta,
-            plan.bgd.used_dirs_delta,
-        )?;
-        self.buffer_patch_sb_counters(
-            &mut buf,
-            plan.sb.free_blocks_delta,
-            plan.sb.free_inodes_delta,
-        )?;
-
-        let raw = self.build_regular_file_inode(new_ino, mode)?;
-        self.buffer_write_inode(&mut buf, new_ino, &raw)?;
-
         match self.buffer_add_dir_entry_inplace(
             &mut buf,
-            parent_ino_num,
+            parent_ino,
             &parent_inode,
             base_name.as_bytes(),
             new_ino,
@@ -1956,7 +2088,7 @@ impl Filesystem {
                 // documented limitation until extend has a buffer-twin.
                 self.commit_block_buffer(buf)?;
                 self.extend_dir_and_add_entry(
-                    parent_ino_num,
+                    parent_ino,
                     base_name.as_bytes(),
                     new_ino,
                     crate::dir::DirEntryType::RegFile,
@@ -1965,6 +2097,110 @@ impl Filesystem {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Create a special file (FIFO, socket, char device, block device).
+    /// `mode` must include the type bits (`S_IFIFO`, `S_IFSOCK`, `S_IFCHR`,
+    /// or `S_IFBLK`) plus the permission bits. `major` and `minor` are the
+    /// device numbers (both 0 for FIFOs and sockets). Mirrors POSIX `mknod`.
+    pub fn apply_mknod(&self, path: &str, mode: u16, major: u32, minor: u32) -> Result<u32> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let file_type = mode & crate::inode::S_IFMT;
+        let dir_entry_type = match file_type {
+            crate::inode::S_IFCHR => crate::dir::DirEntryType::CharDev,
+            crate::inode::S_IFBLK => crate::dir::DirEntryType::BlockDev,
+            crate::inode::S_IFIFO => crate::dir::DirEntryType::Fifo,
+            crate::inode::S_IFSOCK => crate::dir::DirEntryType::Socket,
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "mknod: unsupported type; use create/mkdir for reg/dir",
+                ))
+            }
+        };
+        let NewInodePlan {
+            new_ino,
+            parent_ino,
+            parent_inode,
+            mut buf,
+            base_name,
+        } = self.plan_new_inode_in_dir(path)?;
+
+        let raw = self.build_special_file_inode(new_ino, mode, major, minor)?;
+        self.buffer_write_inode(&mut buf, new_ino, &raw)?;
+
+        match self.buffer_add_dir_entry_inplace(
+            &mut buf,
+            parent_ino,
+            &parent_inode,
+            base_name.as_bytes(),
+            new_ino,
+            dir_entry_type,
+        ) {
+            Ok(()) => {
+                self.commit_block_buffer(buf)?;
+                Ok(new_ino)
+            }
+            Err(Error::OutOfBounds) => {
+                self.commit_block_buffer(buf)?;
+                self.extend_dir_and_add_entry(
+                    parent_ino,
+                    base_name.as_bytes(),
+                    new_ino,
+                    dir_entry_type,
+                )?;
+                Ok(new_ino)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Write inode checksum fields (lo at OFF_CHECKSUM_LO, hi at OFF_CHECKSUM_HI)
+    /// when metadata checksums are enabled for this filesystem.
+    fn stamp_inode_checksum(&self, raw: &mut [u8], ino: u32, generation: u32) {
+        use crate::inode::{INODE_SIZE_WITH_EXTRA, OFF_CHECKSUM_HI, OFF_CHECKSUM_LO};
+        if self.csum.enabled {
+            if let Some((lo, hi)) = self.csum.compute_inode_checksum(ino, generation, raw) {
+                raw[OFF_CHECKSUM_LO..OFF_CHECKSUM_LO + 2].copy_from_slice(&lo.to_le_bytes());
+                if raw.len() >= INODE_SIZE_WITH_EXTRA {
+                    raw[OFF_CHECKSUM_HI..OFF_CHECKSUM_HI + 2].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    fn build_special_file_inode(
+        &self,
+        ino: u32,
+        mode: u16,
+        major: u32,
+        minor: u32,
+    ) -> Result<Vec<u8>> {
+        use crate::inode::{OFF_BLOCK, OFF_LINKS_COUNT, OFF_MODE};
+        let inode_size = self.sb.inode_size as usize;
+        let mut raw = vec![0u8; inode_size];
+
+        raw[OFF_MODE..OFF_MODE + 2].copy_from_slice(&mode.to_le_bytes());
+        raw[OFF_LINKS_COUNT..OFF_LINKS_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
+
+        // Device files: store encoded device number in i_block (no EXTENTS).
+        // Linux stores old (i_block[0]) and new (i_block[1]) formats.
+        let file_type = mode & crate::inode::S_IFMT;
+        if file_type == crate::inode::S_IFBLK || file_type == crate::inode::S_IFCHR {
+            let old_dev = (major << 8) | (minor & 0xff);
+            raw[OFF_BLOCK..OFF_BLOCK + 4].copy_from_slice(&old_dev.to_le_bytes());
+            let new_dev = (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
+            raw[OFF_BLOCK + 4..OFF_BLOCK + 8].copy_from_slice(&new_dev.to_le_bytes());
+        }
+
+        let now = now_unix_seconds();
+        write_inode_timestamps(&mut raw, now);
+        let generation = alloc_inode_generation();
+        write_inode_generation(&mut raw, generation);
+        write_inode_extra_isize(&mut raw);
+        self.stamp_inode_checksum(&mut raw, ino, generation);
+        Ok(raw)
     }
 
     /// Create a symbolic link at `linkpath` whose target is `target`.
@@ -1995,55 +2231,17 @@ impl Filesystem {
         if target.len() > max_target {
             return Err(Error::NameTooLong);
         }
-        let (parent_path, base_name) = split_parent_and_base(linkpath)?;
-        if base_name.len() > 255 {
-            return Err(Error::NameTooLong);
-        }
 
-        // Resolve parent + refuse duplicate.
-        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let parent_ino_num =
-            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
-        let (parent_inode, _parent_raw) = self.read_inode_verified(parent_ino_num)?;
-        if !parent_inode.is_dir() {
-            return Err(Error::NotADirectory);
-        }
-        if self
-            .find_entry_in_dir(&parent_inode, base_name.as_bytes())
-            .is_ok()
-        {
-            return Err(Error::AlreadyExists);
-        }
+        let NewInodePlan {
+            new_ino,
+            parent_ino,
+            parent_inode,
+            mut buf,
+            base_name,
+        } = self.plan_new_inode_in_dir(linkpath)?;
 
-        // Allocate a new inode.
-        let parent_group = (parent_ino_num - 1) / self.sb.inodes_per_group;
+        let parent_group = (parent_ino - 1) / self.sb.inodes_per_group;
         let bs = self.sb.block_size();
-        let mut bitmap_reader = |block: u64| self.read_block(block);
-        let plan = crate::alloc::plan_inode_allocation(
-            &self.sb,
-            &self.groups,
-            false,
-            parent_group,
-            &mut bitmap_reader,
-        )?;
-        let new_ino = plan.inode;
-
-        // Multi-block transaction: inode bitmap + counters + new inode +
-        // (optionally) data block + parent dir entry.
-        let mut buf = BlockBuffer::new(bs);
-        self.buffer_mark_inode_used(&mut buf, new_ino)?;
-        self.buffer_patch_bgd_counters(
-            &mut buf,
-            plan.bgd.group_idx as usize,
-            plan.bgd.free_blocks_delta,
-            plan.bgd.free_inodes_delta,
-            plan.bgd.used_dirs_delta,
-        )?;
-        self.buffer_patch_sb_counters(
-            &mut buf,
-            plan.sb.free_blocks_delta,
-            plan.sb.free_inodes_delta,
-        )?;
 
         // Fast-symlink if target strictly fits inline (i_block is 60 bytes);
         // otherwise allocate a block and stage its bytes into the buffer.
@@ -2087,7 +2285,7 @@ impl Filesystem {
 
         match self.buffer_add_dir_entry_inplace(
             &mut buf,
-            parent_ino_num,
+            parent_ino,
             &parent_inode,
             base_name.as_bytes(),
             new_ino,
@@ -2100,7 +2298,7 @@ impl Filesystem {
             Err(Error::OutOfBounds) => {
                 self.commit_block_buffer(buf)?;
                 self.extend_dir_and_add_entry(
-                    parent_ino_num,
+                    parent_ino,
                     base_name.as_bytes(),
                     new_ino,
                     crate::dir::DirEntryType::Symlink,
@@ -2116,58 +2314,27 @@ impl Filesystem {
     /// store their target directly in the 60-byte `i_block` area — no
     /// extent tree).
     fn build_fast_symlink_inode(&self, ino: u32, target: &[u8]) -> Result<Vec<u8>> {
+        use crate::inode::{OFF_BLOCK, OFF_FLAGS, OFF_LINKS_COUNT, OFF_MODE, OFF_SIZE_LO};
         debug_assert!(target.len() < 60);
-        let inode_size = self.sb.inode_size as usize;
-        let mut raw = vec![0u8; inode_size];
+        let mut raw = vec![0u8; self.sb.inode_size as usize];
 
         // Symlinks are traditionally rwxrwxrwx — the OS enforces access on
         // the *target*, not the symlink itself.
         let mode_bits = crate::inode::S_IFLNK | 0o0777;
-        raw[0x00..0x02].copy_from_slice(&mode_bits.to_le_bytes());
-
-        // i_size = target length (low 32).
-        raw[0x04..0x08].copy_from_slice(&(target.len() as u32).to_le_bytes());
-
-        // i_links_count = 1.
-        raw[0x1A..0x1C].copy_from_slice(&1u16.to_le_bytes());
-
-        // i_flags = 0 (no EXTENTS — fast symlink stores target inline).
-        raw[0x20..0x24].copy_from_slice(&0u32.to_le_bytes());
-
-        // i_block at 0x28..0x64: target bytes, zero-padded.
-        let blk_off = 0x28;
-        raw[blk_off..blk_off + target.len()].copy_from_slice(target);
+        raw[OFF_MODE..OFF_MODE + 2].copy_from_slice(&mode_bits.to_le_bytes());
+        raw[OFF_SIZE_LO..OFF_SIZE_LO + 4].copy_from_slice(&(target.len() as u32).to_le_bytes());
+        raw[OFF_LINKS_COUNT..OFF_LINKS_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
+        // Fast symlinks store the target inline in the i_block area — no extent tree.
+        raw[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&0u32.to_le_bytes());
+        let inline_target_off = OFF_BLOCK;
+        raw[inline_target_off..inline_target_off + target.len()].copy_from_slice(target);
 
         let now = now_unix_seconds();
-        raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime
-        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
-        raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
-                                                             // i_crtime at 0x90 — birth time. Only valid on inodes with the
-                                                             // extra section (i_extra_isize covers it); 256-byte modern ext4
-                                                             // inodes meet that bar. Without this, `stat -f %B` on darwin /
-                                                             // st_birthtime returns the Unix epoch (1970-01-01).
-        if inode_size >= 0x94 {
-            raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
-        }
-
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
-        let generation =
-            std::process::id().wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
-        raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
-
-        if inode_size >= 0x82 + 2 {
-            raw[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
-        }
-
-        if self.csum.enabled {
-            if let Some((lo, hi)) = self.csum.compute_inode_checksum(ino, generation, &raw) {
-                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                if raw.len() >= 0x84 {
-                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                }
-            }
-        }
+        write_inode_timestamps(&mut raw, now);
+        let generation = alloc_inode_generation();
+        write_inode_generation(&mut raw, generation);
+        write_inode_extra_isize(&mut raw);
+        self.stamp_inode_checksum(&mut raw, ino, generation);
         Ok(raw)
     }
 
@@ -2179,72 +2346,46 @@ impl Filesystem {
     /// Caller must have already written the target bytes (zero-padded) to
     /// `data_phys * block_size`.
     fn build_slow_symlink_inode(&self, ino: u32, target: &[u8], data_phys: u64) -> Result<Vec<u8>> {
+        use crate::inode::{
+            OFF_BLOCK, OFF_BLOCKS_LO, OFF_FLAGS, OFF_LINKS_COUNT, OFF_MODE, OFF_SIZE_LO,
+        };
         debug_assert!(target.len() >= 60 && target.len() <= 4096);
-        let inode_size = self.sb.inode_size as usize;
-        let mut raw = vec![0u8; inode_size];
+        let mut raw = vec![0u8; self.sb.inode_size as usize];
 
         let mode_bits = crate::inode::S_IFLNK | 0o0777;
-        raw[0x00..0x02].copy_from_slice(&mode_bits.to_le_bytes());
-
-        // i_size (lo 32) = target length.
-        raw[0x04..0x08].copy_from_slice(&(target.len() as u32).to_le_bytes());
-
-        // i_links_count = 1.
-        raw[0x1A..0x1C].copy_from_slice(&1u16.to_le_bytes());
-
-        // i_blocks_lo = sectors consumed by the single data block.
+        raw[OFF_MODE..OFF_MODE + 2].copy_from_slice(&mode_bits.to_le_bytes());
+        raw[OFF_SIZE_LO..OFF_SIZE_LO + 4].copy_from_slice(&(target.len() as u32).to_le_bytes());
+        raw[OFF_LINKS_COUNT..OFF_LINKS_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
         let bs = self.sb.block_size() as u64;
         let sectors = bs / 512;
-        raw[0x1C..0x20].copy_from_slice(&(sectors as u32).to_le_bytes());
+        raw[OFF_BLOCKS_LO..OFF_BLOCKS_LO + 4].copy_from_slice(&(sectors as u32).to_le_bytes());
+        raw[OFF_FLAGS..OFF_FLAGS + 4]
+            .copy_from_slice(&crate::inode::InodeFlags::EXTENTS.bits().to_le_bytes());
 
-        // i_flags = EXTENTS.
-        let flags = crate::inode::InodeFlags::EXTENTS.bits();
-        raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+        // i_block: extent leaf header + one entry covering the single data block.
+        let extent_header_off = OFF_BLOCK;
+        raw[extent_header_off..extent_header_off + 2]
+            .copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
+        raw[extent_header_off + 2..extent_header_off + 4].copy_from_slice(&1u16.to_le_bytes());
+        raw[extent_header_off + 4..extent_header_off + 6].copy_from_slice(&4u16.to_le_bytes());
+        raw[extent_header_off + 6..extent_header_off + 8].copy_from_slice(&0u16.to_le_bytes());
 
-        // i_block at 0x28..0x64: extent leaf header + one entry.
-        let eh_off = 0x28;
-        raw[eh_off..eh_off + 2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
-        raw[eh_off + 2..eh_off + 4].copy_from_slice(&1u16.to_le_bytes()); // entries=1
-        raw[eh_off + 4..eh_off + 6].copy_from_slice(&4u16.to_le_bytes()); // max=4
-        raw[eh_off + 6..eh_off + 8].copy_from_slice(&0u16.to_le_bytes()); // depth=0
-
-        // Single leaf extent at entry-slot index 1 (offset +12): logical=0,
-        // length=1, physical=data_phys.
-        let e_off = eh_off + 12;
-        raw[e_off..e_off + 4].copy_from_slice(&0u32.to_le_bytes()); // ee_block
-        raw[e_off + 4..e_off + 6].copy_from_slice(&1u16.to_le_bytes()); // ee_len
-        let phys_hi = ((data_phys >> 32) & 0xFFFF) as u16;
-        let phys_lo = (data_phys & 0xFFFF_FFFF) as u32;
-        raw[e_off + 6..e_off + 8].copy_from_slice(&phys_hi.to_le_bytes());
-        raw[e_off + 8..e_off + 12].copy_from_slice(&phys_lo.to_le_bytes());
+        // Single leaf extent: logical block 0, length 1, physical = data_phys.
+        let extent_entry_off = extent_header_off + 12;
+        raw[extent_entry_off..extent_entry_off + 4].copy_from_slice(&0u32.to_le_bytes());
+        raw[extent_entry_off + 4..extent_entry_off + 6].copy_from_slice(&1u16.to_le_bytes());
+        let (extent_phys_hi, extent_phys_lo) = crate::extent_mut::split_phys_block(data_phys);
+        raw[extent_entry_off + 6..extent_entry_off + 8]
+            .copy_from_slice(&extent_phys_hi.to_le_bytes());
+        raw[extent_entry_off + 8..extent_entry_off + 12]
+            .copy_from_slice(&extent_phys_lo.to_le_bytes());
 
         let now = now_unix_seconds();
-        raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime
-        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
-        raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
-                                                             // i_crtime at 0x90 — see build_fast_symlink_inode for rationale.
-        if inode_size >= 0x94 {
-            raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
-        }
-
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
-        let generation =
-            std::process::id().wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
-        raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
-
-        if inode_size >= 0x82 + 2 {
-            raw[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
-        }
-
-        if self.csum.enabled {
-            if let Some((lo, hi)) = self.csum.compute_inode_checksum(ino, generation, &raw) {
-                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                if raw.len() >= 0x84 {
-                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                }
-            }
-        }
+        write_inode_timestamps(&mut raw, now);
+        let generation = alloc_inode_generation();
+        write_inode_generation(&mut raw, generation);
+        write_inode_extra_isize(&mut raw);
+        self.stamp_inode_checksum(&mut raw, ino, generation);
         Ok(raw)
     }
 
@@ -2253,15 +2394,12 @@ impl Filesystem {
     /// timestamps = now, generation = process-id-derived counter, extra_isize
     /// = 32 so the inode has room for nsec timestamps + checksum_hi.
     fn build_regular_file_inode(&self, ino: u32, mode: u16) -> Result<Vec<u8>> {
-        let inode_size = self.sb.inode_size as usize;
-        let mut raw = vec![0u8; inode_size];
+        use crate::inode::{OFF_BLOCK, OFF_FLAGS, OFF_LINKS_COUNT, OFF_MODE};
+        let mut raw = vec![0u8; self.sb.inode_size as usize];
 
-        // i_mode at 0x00..0x02
         let mode_bits = crate::inode::S_IFREG | (mode & 0x0FFF);
-        raw[0x00..0x02].copy_from_slice(&mode_bits.to_le_bytes());
-
-        // i_links_count at 0x1A..0x1C = 1
-        raw[0x1A..0x1C].copy_from_slice(&1u16.to_le_bytes());
+        raw[OFF_MODE..OFF_MODE + 2].copy_from_slice(&mode_bits.to_le_bytes());
+        raw[OFF_LINKS_COUNT..OFF_LINKS_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
 
         // i_flags + i_block layout depend on the FS dialect:
         // - ext4 (FsFlavor::Ext4): EXTENTS_FL set, i_block holds an empty
@@ -2269,58 +2407,23 @@ impl Filesystem {
         // - ext2 / ext3: no flag, i_block stays all-zero (no direct or
         //   indirect pointers — file is empty so there's nothing to map).
         if self.flavor.uses_extents() {
-            let flags = crate::inode::InodeFlags::EXTENTS.bits();
-            raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+            raw[OFF_FLAGS..OFF_FLAGS + 4]
+                .copy_from_slice(&crate::inode::InodeFlags::EXTENTS.bits().to_le_bytes());
 
-            let eh_off = 0x28;
-            raw[eh_off..eh_off + 2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
-            raw[eh_off + 2..eh_off + 4].copy_from_slice(&0u16.to_le_bytes()); // entries
-            raw[eh_off + 4..eh_off + 6].copy_from_slice(&4u16.to_le_bytes()); // max
-            raw[eh_off + 6..eh_off + 8].copy_from_slice(&0u16.to_le_bytes()); // depth
-                                                                              // eh_generation at eh_off+8..eh_off+12 stays zero
+            let extent_header_off = OFF_BLOCK;
+            raw[extent_header_off..extent_header_off + 2]
+                .copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
+            raw[extent_header_off + 2..extent_header_off + 4].copy_from_slice(&0u16.to_le_bytes());
+            raw[extent_header_off + 4..extent_header_off + 6].copy_from_slice(&4u16.to_le_bytes());
+            raw[extent_header_off + 6..extent_header_off + 8].copy_from_slice(&0u16.to_le_bytes());
         }
-        // (ext2/3 path: i_flags 0x20..0x24 and i_block 0x28..0x64 stay zero
-        //  from the initial vec![0u8; inode_size].)
 
-        // Timestamps: atime 0x08, ctime 0x0C, mtime 0x10, dtime 0x14
         let now = now_unix_seconds();
-        raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime
-        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
-        raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
-                                                             // dtime stays zero (not deleted).
-                                                             // i_crtime at 0x90 — birth time. Only valid on inodes with the
-                                                             // extra section (i_extra_isize covers it); 256-byte modern ext4
-                                                             // inodes meet that bar. Without this, `stat -f %B` on darwin /
-                                                             // st_birthtime returns the Unix epoch (1970-01-01).
-        if inode_size >= 0x94 {
-            raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
-        }
-
-        // i_generation at 0x64..0x68. We combine pid + a process-lifetime
-        // counter so successive creates within the same session have
-        // different generations.
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
-        let generation =
-            std::process::id().wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
-        raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
-
-        // i_extra_isize at 0x80..0x82 — 32 is the modern default (room for
-        // crtime, nsec halves, checksum_hi). ext2 inodes are 128 bytes so
-        // the extra section doesn't exist; the size guard handles both.
-        if inode_size >= 0x82 + 2 {
-            raw[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
-        }
-
-        // Recompute checksum if enabled.
-        if self.csum.enabled {
-            if let Some((lo, hi)) = self.csum.compute_inode_checksum(ino, generation, &raw) {
-                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                if raw.len() >= 0x84 {
-                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                }
-            }
-        }
+        write_inode_timestamps(&mut raw, now);
+        let generation = alloc_inode_generation();
+        write_inode_generation(&mut raw, generation);
+        write_inode_extra_isize(&mut raw);
+        self.stamp_inode_checksum(&mut raw, ino, generation);
         Ok(raw)
     }
 
@@ -3119,27 +3222,8 @@ impl Filesystem {
 
         let mut block = self.read_block(bgt_block)?;
 
-        // Patch one little-endian u16+hi_u16 pair inside the descriptor.
-        let patch_u32 = |block: &mut [u8], lo: usize, hi: Option<usize>, delta: i32| {
-            let cur_lo = u16::from_le_bytes(block[lo..lo + 2].try_into().unwrap()) as u32;
-            let cur_hi = hi
-                .map(|h| u16::from_le_bytes(block[h..h + 2].try_into().unwrap()) as u32)
-                .unwrap_or(0);
-            let cur = (cur_hi << 16) | cur_lo;
-            let new = (cur as i64 + delta as i64).max(0) as u32;
-            block[lo..lo + 2].copy_from_slice(&((new & 0xFFFF) as u16).to_le_bytes());
-            if let Some(h) = hi {
-                block[h..h + 2].copy_from_slice(&(((new >> 16) & 0xFFFF) as u16).to_le_bytes());
-            }
-        };
-        let patch_u16 = |block: &mut [u8], at: usize, delta: i32| {
-            let cur = u16::from_le_bytes(block[at..at + 2].try_into().unwrap()) as i32;
-            let new = (cur + delta).max(0) as u16;
-            block[at..at + 2].copy_from_slice(&new.to_le_bytes());
-        };
-
         // Free-blocks: 16-bit at 0x0C, hi at 0x2A when 64-bit
-        patch_u32(
+        patch_counter_u32(
             &mut block,
             off_in_block + 0x0C,
             if desc_size >= 0x40 {
@@ -3150,7 +3234,7 @@ impl Filesystem {
             free_blocks_delta,
         );
         // Free-inodes: 16-bit at 0x0E, hi at 0x2C when 64-bit
-        patch_u32(
+        patch_counter_u32(
             &mut block,
             off_in_block + 0x0E,
             if desc_size >= 0x40 {
@@ -3162,7 +3246,7 @@ impl Filesystem {
         );
         // Used-dirs: 16-bit only (kernel defines u16+u16 hi at 0x2E too, but
         // dirs per group realistically fit in u16 — handle both anyway).
-        patch_u32(
+        patch_counter_u32(
             &mut block,
             off_in_block + 0x10,
             if desc_size >= 0x40 {
@@ -3172,7 +3256,6 @@ impl Filesystem {
             },
             used_dirs_delta,
         );
-        let _ = patch_u16;
 
         if self.csum.enabled {
             let stored_at = off_in_block + 0x1E;
@@ -3306,76 +3389,54 @@ impl Filesystem {
     /// with a single leaf extent mapping logical 0 → `data_phys_block`,
     /// timestamps = now.
     fn build_directory_inode(&self, ino: u32, mode: u16, data_phys_block: u64) -> Result<Vec<u8>> {
-        let inode_size = self.sb.inode_size as usize;
-        let mut raw = vec![0u8; inode_size];
+        use crate::inode::{
+            OFF_BLOCK, OFF_BLOCKS_HI, OFF_BLOCKS_LO, OFF_FLAGS, OFF_LINKS_COUNT, OFF_MODE,
+            OFF_SIZE_HI, OFF_SIZE_LO,
+        };
+        let mut raw = vec![0u8; self.sb.inode_size as usize];
 
         let mode_bits = crate::inode::S_IFDIR | (mode & 0x0FFF);
-        raw[0x00..0x02].copy_from_slice(&mode_bits.to_le_bytes());
-
-        // i_links_count = 2: one for the "." entry, one for the parent's entry
-        // naming this dir. A subdir created later in this dir bumps it to 3, etc.
-        raw[0x1A..0x1C].copy_from_slice(&2u16.to_le_bytes());
-
-        // i_flags = EXTENTS
-        raw[0x20..0x24].copy_from_slice(&crate::inode::InodeFlags::EXTENTS.bits().to_le_bytes());
+        raw[OFF_MODE..OFF_MODE + 2].copy_from_slice(&mode_bits.to_le_bytes());
+        // 2 hard links: one for "." and one for the parent's entry naming this dir.
+        raw[OFF_LINKS_COUNT..OFF_LINKS_COUNT + 2].copy_from_slice(&2u16.to_le_bytes());
+        raw[OFF_FLAGS..OFF_FLAGS + 4]
+            .copy_from_slice(&crate::inode::InodeFlags::EXTENTS.bits().to_le_bytes());
 
         // i_block (60 B): extent header (leaf, 1 entry, max 4) + one Extent.
-        let eh = 0x28;
-        raw[eh..eh + 2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
-        raw[eh + 2..eh + 4].copy_from_slice(&1u16.to_le_bytes()); // entries
-        raw[eh + 4..eh + 6].copy_from_slice(&4u16.to_le_bytes()); // max
-                                                                  // depth=0 leaf, generation=0
-                                                                  // Entry at eh+12..eh+24: logical 0, len 1, phys = data_phys_block.
-        let e = eh + 12;
-        raw[e..e + 4].copy_from_slice(&0u32.to_le_bytes()); // logical
-        raw[e + 4..e + 6].copy_from_slice(&1u16.to_le_bytes()); // length
-        let hi = ((data_phys_block >> 32) & 0xFFFF) as u16;
-        let lo = (data_phys_block & 0xFFFF_FFFF) as u32;
-        raw[e + 6..e + 8].copy_from_slice(&hi.to_le_bytes());
-        raw[e + 8..e + 12].copy_from_slice(&lo.to_le_bytes());
+        let extent_header_off = OFF_BLOCK;
+        raw[extent_header_off..extent_header_off + 2]
+            .copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
+        raw[extent_header_off + 2..extent_header_off + 4].copy_from_slice(&1u16.to_le_bytes());
+        raw[extent_header_off + 4..extent_header_off + 6].copy_from_slice(&4u16.to_le_bytes());
+        // depth=0 leaf, generation=0 — both stay zero from initial vec![0u8; ...]
 
-        // Size = block_size (the single data block fills the file).
+        // Entry at extent_header_off+12: logical 0, len 1, phys = data_phys_block.
+        let extent_entry_off = extent_header_off + 12;
+        raw[extent_entry_off..extent_entry_off + 4].copy_from_slice(&0u32.to_le_bytes());
+        raw[extent_entry_off + 4..extent_entry_off + 6].copy_from_slice(&1u16.to_le_bytes());
+        let (extent_phys_hi, extent_phys_lo) = crate::extent_mut::split_phys_block(data_phys_block);
+        raw[extent_entry_off + 6..extent_entry_off + 8]
+            .copy_from_slice(&extent_phys_hi.to_le_bytes());
+        raw[extent_entry_off + 8..extent_entry_off + 12]
+            .copy_from_slice(&extent_phys_lo.to_le_bytes());
+
+        // Size = block_size (the single data block fills the dir).
         let bs = self.sb.block_size() as u64;
-        let size_lo = (bs & 0xFFFF_FFFF) as u32;
-        let size_hi = (bs >> 32) as u32;
-        raw[0x04..0x08].copy_from_slice(&size_lo.to_le_bytes());
-        raw[0x6C..0x70].copy_from_slice(&size_hi.to_le_bytes());
+        raw[OFF_SIZE_LO..OFF_SIZE_LO + 4]
+            .copy_from_slice(&((bs & 0xFFFF_FFFF) as u32).to_le_bytes());
+        raw[OFF_SIZE_HI..OFF_SIZE_HI + 4].copy_from_slice(&((bs >> 32) as u32).to_le_bytes());
 
-        // i_blocks in 512-byte sectors.
         let sectors = bs / 512;
-        raw[0x1C..0x20].copy_from_slice(&(sectors as u32).to_le_bytes());
-        raw[0x74..0x76].copy_from_slice(&(((sectors >> 32) & 0xFFFF) as u16).to_le_bytes());
+        raw[OFF_BLOCKS_LO..OFF_BLOCKS_LO + 4].copy_from_slice(&(sectors as u32).to_le_bytes());
+        raw[OFF_BLOCKS_HI..OFF_BLOCKS_HI + 2]
+            .copy_from_slice(&(((sectors >> 32) & 0xFFFF) as u16).to_le_bytes());
 
-        // Timestamps (atime/ctime/mtime = now).
         let now = now_unix_seconds();
-        raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes());
-        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
-        raw[0x10..0x14].copy_from_slice(&now.to_le_bytes());
-        // i_crtime at 0x90 — see build_regular_file_inode for rationale.
-        if inode_size >= 0x94 {
-            raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
-        }
-
-        // i_generation at 0x64..0x68 — mirror apply_create's derivation so
-        // successive mkdir calls have distinct values.
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
-        let generation =
-            std::process::id().wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
-        raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
-
-        if inode_size >= 0x82 + 2 {
-            raw[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
-        }
-
-        if self.csum.enabled {
-            if let Some((lo16, hi16)) = self.csum.compute_inode_checksum(ino, generation, &raw) {
-                raw[0x7C..0x7E].copy_from_slice(&lo16.to_le_bytes());
-                if raw.len() >= 0x84 {
-                    raw[0x82..0x84].copy_from_slice(&hi16.to_le_bytes());
-                }
-            }
-        }
+        write_inode_timestamps(&mut raw, now);
+        let generation = alloc_inode_generation();
+        write_inode_generation(&mut raw, generation);
+        write_inode_extra_isize(&mut raw);
+        self.stamp_inode_checksum(&mut raw, ino, generation);
         Ok(raw)
     }
 
@@ -4139,9 +4200,18 @@ impl Filesystem {
             );
         }
         if root_header.depth > 1 {
-            return Err(Error::CorruptExtentTree(
-                "extend_dir_and_add_entry: depth > 1 extent trees are not yet supported (leaf-split needed)",
-            ));
+            return self.extend_dir_and_add_entry_deep(
+                parent_ino,
+                &parent_inode,
+                &mut parent_raw,
+                name,
+                target_ino,
+                file_type,
+                has_ft,
+                new_phys,
+                new_extent,
+                plan,
+            );
         }
 
         let (new_root, leaf_meta_alloc) =
@@ -4285,13 +4355,163 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Grow a directory whose extent tree is already at depth ≥ 2.
+    /// Uses `plan_insert_extent_deep` to navigate and split the tree,
+    /// allocating index-node blocks on demand via `plan_block_allocation`.
+    /// The pre-allocated data block `new_phys` is committed first so the
+    /// alloc closure won't re-use it for tree-meta blocks.
+    #[allow(clippy::too_many_arguments)]
+    fn extend_dir_and_add_entry_deep(
+        &self,
+        parent_ino: u32,
+        parent_inode: &Inode,
+        parent_raw: &mut [u8],
+        name: &[u8],
+        target_ino: u32,
+        file_type: crate::dir::DirEntryType,
+        has_ft: bool,
+        new_phys: u64,
+        new_extent: crate::extent::Extent,
+        data_plan: crate::alloc::BlockAllocationPlan,
+    ) -> Result<()> {
+        let bs = self.sb.block_size();
+        let bs_u64 = bs as u64;
+        let parent_group = (parent_ino - 1) / self.sb.inodes_per_group;
+
+        // Collect all allocation plans without committing them yet.  Committing
+        // eagerly (old behaviour) leaked blocks permanently when
+        // plan_insert_extent_deep or the subsequent writes failed — the bitmap
+        // was marked used but no extent ever referenced those blocks.  Instead,
+        // we gather all plans and commit them only after every write succeeds,
+        // matching the late-commit ordering of extend_dir_and_add_entry_depth1.
+        //
+        // To prevent alloc_fn from picking data_plan.first_block for a meta
+        // node (which plan_block_allocation could do since the bitmap is
+        // unchanged), the closure skips that block and retries once.
+        let data_block = data_plan.first_block;
+        let mut pending_meta: Vec<crate::alloc::BlockAllocationPlan> = Vec::new();
+
+        let reader = FsBlockReader { fs: self };
+        let mut meta_block_count: u64 = 0;
+        let mut alloc_fn = || -> Result<u64> {
+            let mut bm_reader = |block: u64| -> Result<Vec<u8>> {
+                let mut buf = vec![0u8; bs as usize];
+                self.dev.read_at(block * bs_u64, &mut buf)?;
+                Ok(buf)
+            };
+            let meta_plan = crate::alloc::plan_block_allocation(
+                &self.sb,
+                &self.groups,
+                1,
+                parent_group,
+                &mut bm_reader,
+            )?;
+            if meta_plan.first_block == data_block {
+                // The allocator returned the same block we reserved for the
+                // data page.  There are no other free blocks in this group,
+                // so the tree cannot grow further.
+                return Err(Error::NoSpaceLeftOnDevice);
+            }
+            meta_block_count += 1;
+            pending_meta.push(meta_plan);
+            Ok(pending_meta.last().unwrap().first_block)
+        };
+
+        let deep_plan = crate::extent_mut::plan_insert_extent_deep(
+            &parent_inode.block,
+            new_extent,
+            bs,
+            &reader,
+            &mut alloc_fn,
+        )?;
+
+        // Write tree-meta blocks (rewritten leaves + any new index nodes).
+        for (block, mut bytes) in deep_plan.block_writes {
+            if self.csum.enabled {
+                self.csum
+                    .patch_extent_tail(parent_ino, parent_inode.generation, &mut bytes);
+            }
+            self.dev.write_at(block * bs_u64, &bytes)?;
+        }
+
+        // Patch inode: root bytes, size (+1 data block), i_blocks.
+        Self::patch_inode_block_area(parent_raw, &deep_plan.new_root)?;
+        let new_size = parent_inode.size + bs_u64;
+        let new_blocks = parent_inode.blocks + (bs_u64 / 512) * (1 + meta_block_count);
+        Self::patch_inode_size_and_blocks(parent_raw, new_size, new_blocks)?;
+        if self.csum.enabled {
+            if let Some((lo, hi)) =
+                self.csum
+                    .compute_inode_checksum(parent_ino, parent_inode.generation, parent_raw)
+            {
+                parent_raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if parent_raw.len() >= 0x84 {
+                    parent_raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        self.write_inode_raw(parent_ino, parent_raw)?;
+
+        // Seed + write the new data block with the directory entry.
+        let reserved_tail = if self.csum.enabled { 12 } else { 0 };
+        let usable = (bs as usize) - reserved_tail;
+        let mut block = vec![0u8; bs as usize];
+        block[0..4].copy_from_slice(&0u32.to_le_bytes());
+        block[4..6].copy_from_slice(&(usable as u16).to_le_bytes());
+        crate::dir::add_entry_to_block(
+            &mut block,
+            target_ino,
+            name,
+            file_type,
+            has_ft,
+            reserved_tail,
+        )?;
+        if self.csum.enabled && reserved_tail == 12 {
+            let end = block.len();
+            block[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes());
+            block[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes());
+            block[end - 6] = 0;
+            block[end - 5] = 0xDE;
+            let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
+            c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
+            c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
+            block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+        }
+        self.dev.write_at(new_phys * bs_u64, &block)?;
+
+        // All writes succeeded — now commit the allocation accounting.
+        self.mark_block_run_used(data_plan.first_block, 1)?;
+        self.patch_bgd_counters(
+            data_plan.bgd.group_idx as usize,
+            data_plan.bgd.free_blocks_delta,
+            data_plan.bgd.free_inodes_delta,
+            data_plan.bgd.used_dirs_delta,
+        )?;
+        self.patch_sb_counters(
+            data_plan.sb.free_blocks_delta,
+            data_plan.sb.free_inodes_delta,
+        )?;
+        for plan in pending_meta {
+            self.mark_block_run_used(plan.first_block, 1)?;
+            self.patch_bgd_counters(
+                plan.bgd.group_idx as usize,
+                plan.bgd.free_blocks_delta,
+                plan.bgd.free_inodes_delta,
+                plan.bgd.used_dirs_delta,
+            )?;
+            self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+        }
+
+        Ok(())
+    }
+
     /// Grow a directory whose extent tree is already at depth 1 (i.e. has
     /// been promoted). The inline root holds a single index entry → one leaf
     /// block. The mutation happens entirely inside the leaf block; the inode
     /// root is unchanged.
     ///
     /// Leaf overflow (>340 entries in a 4 KiB block with csum) returns a
-    /// clean error. True leaf-split / depth-2 promotion is deferred.
+    /// clean error. Callers that hit this should retry via `extend_dir_and_add_entry_deep`.
     #[allow(clippy::too_many_arguments)]
     fn extend_dir_and_add_entry_depth1(
         &self,
@@ -4334,7 +4554,28 @@ impl Filesystem {
             });
         }
 
-        let muts = crate::extent_mut::plan_insert_extent(&leaf, new_extent)?;
+        let muts = match crate::extent_mut::plan_insert_extent(&leaf, new_extent) {
+            Ok(muts) => muts,
+            Err(Error::CorruptExtentTree(msg)) if msg.contains("LEAF_FULL_NEEDS_PROMOTION") => {
+                // The single depth-1 leaf is full (≥340 extents in a 4 KiB block
+                // with csum). Fall back to the deep path, which handles adding a
+                // sibling leaf or promoting to depth 2. The data block hasn't
+                // been committed yet, so pass `plan` unchanged.
+                return self.extend_dir_and_add_entry_deep(
+                    parent_ino,
+                    parent_inode,
+                    parent_raw,
+                    name,
+                    target_ino,
+                    file_type,
+                    has_ft,
+                    new_phys,
+                    new_extent,
+                    plan,
+                );
+            }
+            Err(e) => return Err(e),
+        };
         let new_leaf = muts
             .into_iter()
             .find_map(|m| match m {
@@ -4574,5 +4815,99 @@ impl Filesystem {
         self.buffer_write_inode(&mut buf, parent_ino, &parent_raw)?;
 
         self.commit_block_buffer(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inode::{
+        EXTRA_ISIZE_DEFAULT, INODE_SIZE_WITH_CRTIME, INODE_SIZE_WITH_EXTRA, OFF_ATIME, OFF_CRTIME,
+        OFF_CTIME, OFF_EXTRA_ISIZE, OFF_GENERATION, OFF_MTIME,
+    };
+
+    fn read_le32(buf: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+    }
+    fn read_le16(buf: &[u8], off: usize) -> u16 {
+        u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
+    }
+
+    // --- write_inode_timestamps ---
+
+    #[test]
+    fn write_inode_timestamps_sets_atime_ctime_mtime() {
+        let mut raw = vec![0u8; 256];
+        write_inode_timestamps(&mut raw, 0xDEAD_BEEF);
+        assert_eq!(read_le32(&raw, OFF_ATIME), 0xDEAD_BEEF);
+        assert_eq!(read_le32(&raw, OFF_CTIME), 0xDEAD_BEEF);
+        assert_eq!(read_le32(&raw, OFF_MTIME), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn write_inode_timestamps_sets_crtime_when_large_enough() {
+        let mut raw = vec![0u8; INODE_SIZE_WITH_CRTIME + 4];
+        write_inode_timestamps(&mut raw, 0x1234_5678);
+        assert_eq!(read_le32(&raw, OFF_CRTIME), 0x1234_5678);
+    }
+
+    #[test]
+    fn write_inode_timestamps_skips_crtime_when_too_small() {
+        let mut raw = vec![0xAAu8; INODE_SIZE_WITH_CRTIME - 1];
+        write_inode_timestamps(&mut raw, 0x1234_5678);
+        // Buffer too small for crtime — no write, no panic.
+        // atime/ctime/mtime still set.
+        assert_eq!(read_le32(&raw, OFF_ATIME), 0x1234_5678);
+    }
+
+    #[test]
+    fn write_inode_timestamps_zero_now() {
+        let mut raw = vec![0xFFu8; 256];
+        write_inode_timestamps(&mut raw, 0);
+        assert_eq!(read_le32(&raw, OFF_ATIME), 0);
+        assert_eq!(read_le32(&raw, OFF_CTIME), 0);
+        assert_eq!(read_le32(&raw, OFF_MTIME), 0);
+        assert_eq!(read_le32(&raw, OFF_CRTIME), 0);
+    }
+
+    // --- write_inode_generation ---
+
+    #[test]
+    fn write_inode_generation_writes_at_correct_offset() {
+        let mut raw = vec![0u8; 256];
+        write_inode_generation(&mut raw, 0xCAFE_BABE);
+        assert_eq!(read_le32(&raw, OFF_GENERATION), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn write_inode_generation_overwrites_existing() {
+        let mut raw = vec![0xFFu8; 256];
+        write_inode_generation(&mut raw, 0);
+        assert_eq!(read_le32(&raw, OFF_GENERATION), 0);
+    }
+
+    // --- write_inode_extra_isize ---
+
+    #[test]
+    fn write_inode_extra_isize_sets_default_when_large_enough() {
+        let mut raw = vec![0u8; INODE_SIZE_WITH_EXTRA + 4];
+        write_inode_extra_isize(&mut raw);
+        assert_eq!(read_le16(&raw, OFF_EXTRA_ISIZE), EXTRA_ISIZE_DEFAULT);
+    }
+
+    #[test]
+    fn write_inode_extra_isize_skips_when_too_small() {
+        let mut raw = vec![0u8; INODE_SIZE_WITH_EXTRA - 1];
+        write_inode_extra_isize(&mut raw); // must not panic
+                                           // No bytes should have been written — buffer too small.
+    }
+
+    // --- alloc_inode_generation ---
+
+    #[test]
+    fn alloc_inode_generation_produces_unique_values() {
+        let g1 = alloc_inode_generation();
+        let g2 = alloc_inode_generation();
+        assert_ne!(g1, g2, "successive calls must produce distinct values");
     }
 }

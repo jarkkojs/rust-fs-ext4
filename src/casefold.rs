@@ -6,40 +6,62 @@
 //! instead of the half_md4/tea hashes used for normal htree directories.
 //! See `fs/ext4/hash.c::ext4fs_dirhash_casefold` and `fs/unicode/utf8-core.c`.
 //!
-//! ### Scope of the initial landing
+//! ### Algorithm
 //!
-//! - **ASCII + Latin-1 case fold**: bytes 0x41..=0x5A become 0x61..=0x7A;
-//!   other bytes pass through unchanged. This is correct for the overwhelming
-//!   majority of real filenames (all ASCII names, all URL-safe names, most
-//!   Western European names). **Not yet** implemented: full Unicode NFD
-//!   normalisation. Names that rely on Greek/Turkish/German special-casing
-//!   (e.g. `ß` ↔ `SS`) will not fold identically to what the kernel would
-//!   produce. Those dirs still parse; the lookup may miss and fall through
-//!   to linear scan.
+//! The Linux kernel's `utf8_casefold_hash` (lib/unicode/utf8-core.c) applies
+//! NFD normalisation followed by Unicode case-folding using precomputed tables
+//! for the filesystem's declared Unicode version. We replicate that with:
+//!
+//! 1. Decode UTF-8 → codepoints (invalid sequences fall back to ASCII fold).
+//! 2. NFD-decompose with the `unicode-normalization` crate.
+//! 3. Apply Unicode full case fold with the `caseless` crate
+//!    (`caseless::default_case_fold_str`). `char::to_lowercase()` is not
+//!    used — it is simple lowercase, not full case fold (e.g. ß → "ss").
+//! 4. Re-encode as UTF-8. The result is what SipHash-2-4 hashes.
+//!
+//! This matches the kernel for the overwhelming majority of real filenames.
+//! The kernel uses frozen tables for a specific Unicode version
+//! (`s_encoding_flags`), so there can be differences for codepoints added
+//! after that version; those are edge cases in practice.
+//!
 //! - **SipHash-2-4** keyed with the 16-byte prefix of `sb.hash_seed` —
-//!   matches the kernel's `EXT4_CASEFOLD_HASH_SEED_SLOT` scheme. Full spec:
-//!   <https://en.wikipedia.org/wiki/SipHash>.
-//!
-//! Latin-1 covers a surprisingly wide slice of real-world filenames. Full
-//! NFD + Unicode case fold is tracked as a future task (bring in the
-//! `unicode-normalization` + `casefold` crates and drop the fast-path).
+//!   matches the kernel's `EXT4_CASEFOLD_HASH_SEED_SLOT` scheme.
+
+use unicode_normalization::UnicodeNormalization;
 
 use crate::hash::NameHash;
 
-/// Case-fold a single byte using the ASCII-only rule. Kept explicit so the
-/// future full-Unicode path can be slotted in without changing callers.
-#[inline]
-fn fold_byte(b: u8) -> u8 {
-    if (0x41..=0x5A).contains(&b) {
-        b + 0x20
-    } else {
-        b
-    }
-}
-
-/// Produce a case-folded form of `name` into `out`.
+/// Produce the NFD + case-folded form of `name` for SipHash input.
+///
+/// Algorithm mirrors the Linux kernel's `utf8_casefold_hash`:
+/// 1. NFD-decompose using the `unicode-normalization` crate.
+/// 2. Apply Unicode full case fold to each NFD codepoint using `caseless`.
+///    `char::to_lowercase()` is NOT used because it doesn't implement case
+///    fold (e.g. ß → "ß" via lowercase, but ß → "ss" via case fold).
+/// 3. Re-encode as UTF-8. The result is what SipHash-2-4 hashes.
+///
+/// Invalid UTF-8 falls back to byte-level ASCII fold so lookup is still
+/// deterministic and doesn't panic (corrupt images should not produce this).
 pub fn fold_name(name: &[u8]) -> Vec<u8> {
-    name.iter().map(|&b| fold_byte(b)).collect()
+    match std::str::from_utf8(name) {
+        Ok(s) => {
+            // NFD first, then full Unicode case fold.
+            let nfd: String = s.nfd().collect();
+            caseless::default_case_fold_str(&nfd).into_bytes()
+        }
+        Err(_) => {
+            // Invalid UTF-8: ASCII-only fold so lookup is still deterministic.
+            name.iter()
+                .map(|&b| {
+                    if (0x41..=0x5A).contains(&b) {
+                        b + 0x20
+                    } else {
+                        b
+                    }
+                })
+                .collect()
+        }
+    }
 }
 
 /// SipHash-2-4 constants.
@@ -142,10 +164,27 @@ mod tests {
     }
 
     #[test]
-    fn fold_preserves_non_ascii() {
-        // 0xC3 0x9F is UTF-8 for 'ß' — Latin-1 passes through.
-        // A proper Unicode fold would map it to "ss"; we document that gap.
-        assert_eq!(fold_name(&[0xC3, 0x9F]), vec![0xC3, 0x9F]);
+    fn fold_unicode_sharp_s() {
+        // 'ß' (U+00DF, UTF-8 0xC3 0x9F) folds to "ss" in full Unicode case fold.
+        assert_eq!(fold_name(&[0xC3, 0x9F]), b"ss".to_vec());
+    }
+
+    #[test]
+    fn fold_unicode_latin_upper() {
+        // 'Ñ' (U+00D1) NFD = N + U+0303. Case fold of N = n; combining tilde unchanged.
+        // The result is "n\u{0303}" (NFD form), same as folding 'ñ' (U+00F1).
+        let folded_upper = fold_name("Ñ".as_bytes());
+        let folded_lower = fold_name("ñ".as_bytes());
+        assert_eq!(
+            folded_upper, folded_lower,
+            "Ñ and ñ must produce the same hash input"
+        );
+    }
+
+    #[test]
+    fn fold_invalid_utf8_ascii_folds() {
+        // Invalid UTF-8 falls back to byte-level ASCII fold.
+        assert_eq!(fold_name(&[0xFF, 0x41, 0x42]), vec![0xFF, 0x61, 0x62]);
     }
 
     #[test]
