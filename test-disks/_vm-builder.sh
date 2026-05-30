@@ -214,6 +214,7 @@ build_manyfiles() {
 
 build_whole_disk() {
     local img=ext4-whole-disk.img
+    local offset sizelimit loop=""
     echo "[vm] $img"
     rm -f $img
     # 20 MiB: 1 MiB GPT header area + 16 MiB partition (32768 × 512 B) + 1 MiB GPT backup
@@ -223,7 +224,7 @@ build_whole_disk() {
     printf 'label: gpt\nstart=2048, size=32768, type=L\n' | sfdisk $img >/dev/null
     # Use --offset/--sizelimit to map the partition area directly, avoiding
     # the need for kernel partition device support (-P / /dev/loopNpM).
-    local offset sizelimit loop
+    trap 'umount /mnt/img 2>/dev/null || true; [ -n "$loop" ] && losetup -d "$loop" 2>/dev/null || true' EXIT HUP INT TERM
     offset=$((2048 * 512))
     sizelimit=$((32768 * 512))
     loop=$(losetup -f --show --offset "$offset" --sizelimit "$sizelimit" "$img")
@@ -238,6 +239,7 @@ build_whole_disk() {
     sync
     umount /mnt/img
     losetup -d "$loop"
+    trap - EXIT HUP INT TERM
 }
 
 # --- dispatch -------------------------------------------------------------
