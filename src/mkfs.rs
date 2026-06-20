@@ -226,24 +226,11 @@ pub fn format_filesystem_with_flavor(
     // Bits 0..used_blocks are used (for ext3 this includes the journal
     // data run; for ext2/ext4 it stops at root_dir_block).
     let mut block_bitmap = vec![0u8; block_size as usize];
-    for b in 0..used_blocks {
-        let byte = (b / 8) as usize;
-        let bit = (b % 8) as u8;
-        if byte < block_bitmap.len() {
-            block_bitmap[byte] |= 1 << bit;
-        }
-    }
+    set_bitmap_range(&mut block_bitmap, 0, used_blocks);
     // Tail-pad: blocks past `blocks_count` (within the group's bitmap window)
     // are flagged "used" so the allocator never tries them. blocks_per_group
     // bits cover the bitmap's logical span.
-    for b in blocks_count..blocks_per_group as u64 {
-        let byte = (b / 8) as usize;
-        if byte >= block_bitmap.len() {
-            break;
-        }
-        let bit = (b % 8) as u8;
-        block_bitmap[byte] |= 1 << bit;
-    }
+    set_bitmap_range(&mut block_bitmap, blocks_count, blocks_per_group as u64);
 
     // ----- Inode bitmap (group 0) ------------------------------------------
     // ext4 inode numbers are 1-based; bit i = inode (i+1). e2fsprogs marks
@@ -254,13 +241,12 @@ pub fn format_filesystem_with_flavor(
     // bitmap checksum matches what e2fsck recomputes (which assumes all
     // out-of-range bits are 1 — "Padding at end of inode bitmap is not set").
     let mut inode_bitmap = vec![0u8; block_size as usize];
-    for i in 0..RESERVED_INODES {
-        inode_bitmap[(i / 8) as usize] |= 1 << (i % 8);
-    }
-    let bitmap_bits = block_size * 8;
-    for i in inodes_per_group..bitmap_bits {
-        inode_bitmap[(i / 8) as usize] |= 1 << (i % 8);
-    }
+    set_bitmap_range(&mut inode_bitmap, 0, RESERVED_INODES as u64);
+    set_bitmap_range(
+        &mut inode_bitmap,
+        inodes_per_group as u64,
+        block_size as u64 * 8,
+    );
 
     // ----- Inode table (group 0) — only inode 2 has content ----------------
     let mut inode_table = vec![0u8; inode_table_blocks as usize * block_size as usize];
@@ -451,6 +437,18 @@ pub fn format_filesystem_with_flavor(
     dev.flush()?;
     let _ = group_count; // single-group v1; future multi-group will use this
     Ok(())
+}
+
+/// Set bits `[start, end)` in a little-endian on-disk bitmap, clamped to the
+/// buffer length.
+fn set_bitmap_range(bitmap: &mut [u8], start: u64, end: u64) {
+    for bit in start..end {
+        let byte = (bit / 8) as usize;
+        if byte >= bitmap.len() {
+            break;
+        }
+        bitmap[byte] |= 1 << (bit % 8);
+    }
 }
 
 /// Build a clean JBD2 v2 superblock for a fresh ext3 journal. Layout per
